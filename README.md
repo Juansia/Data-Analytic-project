@@ -1,7 +1,4 @@
-# Data-Analytic-project
-Brent Forecasting Model
-# Data-Driven Evaluation of Brent Crude Oil Forecasting Models
-
+# Data-Analytic-project (Data-Driven Evaluation of Brent Crude Oil Forecasting Models)
 An advanced machine learning framework for Brent crude oil price prediction that integrates market sentiment analysis with deep learning architectures, featuring hyperparameter optimization via Grey Wolf Optimizer (GWO) and weighted ensemble methods.
 
 ## 🎯 Overview
