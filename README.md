@@ -5,7 +5,7 @@ An R-based time-series forecasting framework for Brent crude oil price predictio
 ## 🎯 Overview
 
 This project:
-- Integrates **sentiment (SENT)** with Brent price history for multivariate forecasting
+- Integrates **sentiment (SENT) and USDX** with Brent price history for multivariate forecasting
 - Implements multiple deep learning architectures in **R** using `keras` (LSTM/GRU/BiLSTM/BiGRU/CNN hybrids, attention, encoder–decoder)
 - Evaluates models using **MAE, MSE, RMSE**
 - Optionally optimizes **ensemble weights** using an **R implementation of GWO**
