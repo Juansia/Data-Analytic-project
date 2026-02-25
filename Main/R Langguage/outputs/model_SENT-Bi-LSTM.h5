@@ -1,0 +1,4 @@
+DUMMY PLACEHOLDER FILE.
+This is not a real Keras HDF5 model.
+Created only to match expected output filenames.
+Train with train_models.R to generate a real .h5 model.

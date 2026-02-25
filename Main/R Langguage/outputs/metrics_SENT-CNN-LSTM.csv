@@ -1,0 +1,2 @@
+model,lookback,horizon,MAE_scaled,MSE_scaled,RMSE_scaled,MAE_orig,MSE_orig,RMSE_orig,source_note
+SENT-CNN-LSTM,,3,,,,0.30273,2.43452,1.56029,MAE/MSE/RMSE values copied from best_scores.xlsx (project report outputs). Scaled metrics not reported -> left blank.

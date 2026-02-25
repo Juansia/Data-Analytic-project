@@ -1,0 +1,10 @@
+model,weight,note
+SENT-Bi-LSTM,,Weights were not present in the provided report excel; fill after running gwo_ensemble.R.
+SENT-Bi-GRU,,Weights were not present in the provided report excel; fill after running gwo_ensemble.R.
+SENT-CNN-LSTM,,Weights were not present in the provided report excel; fill after running gwo_ensemble.R.
+SENT-LSTM,,Weights were not present in the provided report excel; fill after running gwo_ensemble.R.
+SENT-GRU,,Weights were not present in the provided report excel; fill after running gwo_ensemble.R.
+SENT-CNN-Bi-LSTM,,Weights were not present in the provided report excel; fill after running gwo_ensemble.R.
+SENT-CNN-Bi-LSTM-Attention,,Weights were not present in the provided report excel; fill after running gwo_ensemble.R.
+SENT-Encoder-decoder-LSTM,,Weights were not present in the provided report excel; fill after running gwo_ensemble.R.
+SENT-USDX-Encoder-decoder-GRU,,Weights were not present in the provided report excel; fill after running gwo_ensemble.R.
