@@ -79,14 +79,14 @@ Date,BRENT Close,SENT,USDX
 3) Train models and record best scores.
 
 ### Single model training (best-score output only)
-Open `train_models_best_only.R` and set:
+Open `train_modelsy.R` and set:
 - `MODEL_NAME <- "SENT-Bi-GRU"` (or another model)
 - (optional) `LOOKBACK`, `EPOCHS`, `BATCH_SIZE`
 
 Run in RStudio:
 
 ```r
-source("train_models_best_only.R")
+source("train_models.R")
 ```
 
 Repeat for each model you want to evaluate.
@@ -120,7 +120,7 @@ All outputs are saved under:
 
 `Main/R Language/outputs/`
 
-### From `train_models_best_only.R`
+### From `train_models.R`
 - `best_scores_r.csv`  
   Appends one row per run with:
   - `MAE`, `MSE`, `RMSE` (original Brent price scale)
