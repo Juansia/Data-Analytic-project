@@ -1,4 +1,4 @@
-# train_models_best_only.R
+# train_models.R
 # R-only implementation (keras/TensorFlow) for Brent 3-day-ahead forecasting with SENT (and optional USDX).
 # OUTPUT MODE: BEST SCORE ONLY
 # - Appends results into outputs/best_scores_r.csv
