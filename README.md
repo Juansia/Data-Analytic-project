@@ -62,9 +62,7 @@ Place your dataset CSV here:
 Required columns:
 - `BRENT Close` (target)
 - `SENT` (sentiment feature)
-
-Optional column:
-- `USDX` (required only for `SENT-USDX-Encoder-decoder-GRU`)
+- `USDX` 
 
 Example format:
 ```csv
