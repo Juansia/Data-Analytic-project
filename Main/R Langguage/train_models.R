@@ -33,7 +33,7 @@ suppressPackageStartupMessages({
 # ----------------------------
 
 # Path to your final processed CSV (as described in the PDF: saved under Main/R Language/dataset/)
-DATA_PATH <- "processed_data_best_corr_sentiment.csv"  # <-- change if needed
+DATA_PATH <- "dataset/processed_data_best_corr_sentiment.csv"  # <-- change if needed
 OUT_DIR   <- "outputs"
 
 # Column names in your processed CSV (edit if your headers differ)
