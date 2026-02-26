@@ -1,6 +1,6 @@
 # Data-Analytic-project (R Version) — Data-Driven Evaluation of Brent Crude Oil Forecasting Models
 
-An R-based time-series forecasting framework for Brent crude oil price prediction using **sentiment (SENT)** and optional **USDX** as exogenous inputs. The project trains multiple deep-learning architectures in **R** (via `keras`/TensorFlow) and supports a **Grey Wolf Optimizer (GWO)** weighted ensemble in **R**.
+An R-based time-series forecasting framework for Brent crude oil price prediction using **sentiment (SENT)** and **USDX** as exogenous inputs. The project trains multiple deep-learning architectures in **R** (via `keras`/TensorFlow) and supports a **Grey Wolf Optimizer (GWO)** weighted ensemble in **R**.
 
 ## 🎯 Overview
 
@@ -27,7 +27,7 @@ R implementation files are located in:
 Main/R Language/
 ├── dataset/
 │   └── processed_data_best_corr_sentiment.csv
-├── train_models_best_only.R     # Train one model; append best scores to outputs/best_scores_r.csv
+├── train_models.R     # Train one model; append best scores to outputs/best_scores_r.csv
 ├── gwo_ensemble.R               # (Optional) GWO weighted ensemble in R
 └── outputs/                     # Generated outputs (created automatically)
 ```
@@ -88,7 +88,7 @@ Open `train_models_best_only.R` and set:
 Run in RStudio:
 
 ```r
-source("train_models_best_only.R")
+source("train_models.R")
 ```
 
 Repeat for each model you want to evaluate.
@@ -104,7 +104,7 @@ Edit `MODELS <- c(...)` inside `gwo_ensemble.R` to match the models you trained.
 
 ## 🤖 Available Models
 
-Set `MODEL_NAME` in `train_models_best_only.R` to one of:
+Set `MODEL_NAME` in `train_models.R` to one of:
 
 - `SENT-LSTM`
 - `SENT-GRU`
