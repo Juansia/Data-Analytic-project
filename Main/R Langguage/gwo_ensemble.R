@@ -1,14 +1,19 @@
 # gwo_ensemble.R
-# R-only Grey Wolf Optimizer (GWO) for weighted ensemble of model predictions.
-# This script expects per-model prediction CSVs produced by train_models.R.
+# ------------------------------------------------------------------------------
+# Grey Wolf Optimizer (GWO) for weighted ensemble of model predictions.
 #
-# Recommended workflow:
-# 1) Run train_models.R multiple times (different MODEL_NAME) to produce prediction files in outputs/
-# 2) (Best) Ensure each model also saves validation predictions as outputs/pred_val_<MODEL>.csv
-# 3) Run this script to learn ensemble weights using GWO on validation, then evaluate on test.
+# This script expects the prediction CSVs produced by train_models.R:
+#   outputs/pred_val_<MODEL>.csv
+#   outputs/pred_test_<MODEL>.csv
 #
-# If validation prediction files are NOT available, the script will fall back to using test predictions
-# to fit weights (this is not ideal; use only if you have no validation preds).
+# Each prediction file must include:
+#   target_date, y_true_orig, y_pred_orig
+#
+# Key improvement vs older versions:
+# - Aligns predictions by target_date (works even when models use different TS/lookback)
+# - Fits weights ONLY on validation by default (prevents leakage)
+# - Enforces non-negative weights summing to 1 via softmax(z)
+# ------------------------------------------------------------------------------
 
 suppressPackageStartupMessages({
   library(readr)
@@ -16,150 +21,185 @@ suppressPackageStartupMessages({
 })
 
 # ----------------------------
-# CONFIG (edit these)
+# CONFIG (EDIT THESE)
 # ----------------------------
 OUT_DIR <- "outputs"
 
-# List the models you trained (must match filenames pred_*_<MODEL>.csv)
-MODELS <- c(
-  "SENT-LSTM",
-  "SENT-GRU",
-  "SENT-Bi-LSTM",
-  "SENT-Bi-GRU",
-  "SENT-CNN-Bi-LSTM",
-  "SENT-CNN-Bi-LSTM-Attention",
-  "SENT-Encoder-decoder-LSTM",
-  "SENT-USDX-Encoder-decoder-GRU"
-)
+# If NULL: auto-detect models from outputs/pred_val_*.csv
+# If set: must match filename suffix exactly (e.g., "SENT-Bi-GRU")
+MODELS <- NULL
 
-# Optimization objective on validation set:
-# Choose one: "RMSE" or "MAE"
-OBJECTIVE <- "RMSE"
+# Fit objective on validation set (project text: minimize validation MSE)
+# Choose: "MSE", "RMSE", "MAE"
+OBJECTIVE <- "MSE"
 
-# GWO hyperparameters
-N_WOLVES <- 20
-N_ITERS  <- 80
+# GWO hyperparameters (weight search is cheap, so you can set these high)
+N_WOLVES <- 40
+N_ITERS  <- 250
 SEED     <- 42
 
-# Whether to use ORIGINAL scale columns (recommended)
-# train_models.R saves: y_true_orig, y_pred_orig (and also scaled columns)
-USE_ORIGINAL_SCALE <- TRUE
+# Safety: do NOT fit on test unless you explicitly allow it
+ALLOW_TEST_FIT_IF_NO_VAL <- FALSE
 
 # ----------------------------
 # Helpers
 # ----------------------------
 set.seed(SEED)
 
+mse  <- function(y, p) mean((p - y)^2)
 rmse <- function(y, p) sqrt(mean((p - y)^2))
 mae  <- function(y, p) mean(abs(p - y))
 
 metric_fn <- function(name) {
-  if (toupper(name) == "RMSE") return(rmse)
-  if (toupper(name) == "MAE")  return(mae)
+  nm <- toupper(name)
+  if (nm == "MSE")  return(mse)
+  if (nm == "RMSE") return(rmse)
+  if (nm == "MAE")  return(mae)
   stop("Unknown OBJECTIVE: ", name)
 }
 
-# Softmax -> weights on simplex (nonnegative, sum=1)
 softmax <- function(z) {
   z <- z - max(z)
   e <- exp(z)
   e / sum(e)
 }
 
-# Read a set of prediction files into a matrix of predictions + true values
-read_pred_set <- function(models, prefix) {
-  # prefix: "pred_val_" or "pred_test_"
-  paths <- file.path(OUT_DIR, paste0(prefix, models, ".csv"))
-  missing <- paths[!file.exists(paths)]
-  if (length(missing) > 0) {
-    return(list(ok = FALSE, missing = missing))
+# Read prediction file for one model and split
+read_pred <- function(model_id, split) {
+  path <- file.path(OUT_DIR, paste0("pred_", split, "_", model_id, ".csv"))
+  if (!file.exists(path)) stop("Missing file: ", path)
+
+  df <- read_csv(path, show_col_types = FALSE)
+
+  need <- c("target_date", "y_true_orig", "y_pred_orig")
+  miss <- setdiff(need, names(df))
+  if (length(miss) > 0) {
+    stop("File ", path, " is missing required columns: ", paste(miss, collapse = ", "))
   }
 
-  dfs <- lapply(paths, read_csv, show_col_types = FALSE)
+  df |> transmute(
+    target_date = as.character(target_date),
+    y_true = as.numeric(y_true_orig),
+    pred   = as.numeric(y_pred_orig)
+  )
+}
 
-  if (USE_ORIGINAL_SCALE) {
-    y_col <- "y_true_orig"
-    p_col <- "y_pred_orig"
-  } else {
-    y_col <- "y_true_scaled"
-    p_col <- "y_pred_scaled"
+# Build aligned (date-joined) matrix for a split
+build_matrix <- function(models, split) {
+  dfs <- lapply(models, function(m) {
+    d <- read_pred(m, split)
+    names(d)[names(d) == "pred"] <- m
+    d
+  })
+
+  # Reduce inner joins on target_date
+  merged <- dfs[[1]]
+  for (i in 2:length(dfs)) {
+    merged <- merged |> inner_join(dfs[[i]], by = c("target_date", "y_true"))
   }
 
-  # Consistency check
-  y0 <- dfs[[1]][[y_col]]
-  for (i in seq_along(dfs)) {
-    if (!all(dfs[[i]][[y_col]] == y0)) {
-      stop("True values differ across files. Ensure all models were evaluated on the same split/window.")
+  # If y_true differs numerically due to floating, fall back to date-join then check
+  if (nrow(merged) == 0) {
+    merged <- dfs[[1]]
+    for (i in 2:length(dfs)) {
+      merged <- merged |> inner_join(dfs[[i]] |> select(-y_true), by = "target_date")
+    }
+    # Verify y_true consistency
+    # Use y_true from the first model file, and ensure other files match within tolerance.
+    for (m in models) {
+      # We don't have other y_true columns anymore, so rebuild checks quickly
+      other <- read_pred(m, split)
+      chk <- merged |> inner_join(other, by = "target_date", suffix = c("", ".other"))
+      if (max(abs(chk$y_true - chk$y_true.other), na.rm = TRUE) > 1e-6) {
+        stop("y_true differs across models after aligning by date. Ensure all models were built from the same dataset & horizon.")
+      }
     }
   }
 
-  P <- do.call(cbind, lapply(dfs, function(d) d[[p_col]]))
-  colnames(P) <- models
-  list(ok = TRUE, y = y0, P = P)
-}
+  y <- merged$y_true
+  P <- as.matrix(merged[, models, drop = FALSE])
 
-# Objective for weights
-objective_for_weights <- function(w, y, P, metric) {
-  p_ens <- as.numeric(P %*% w)
-  metric(y, p_ens)
+  list(df = merged, y = y, P = P)
 }
 
 # ----------------------------
-# Load validation and test prediction sets
+# Model discovery (if MODELS is NULL)
 # ----------------------------
-val <- read_pred_set(MODELS, "pred_val_")
-use_test_for_fit <- FALSE
+if (is.null(MODELS)) {
+  files <- list.files(OUT_DIR, pattern = "^pred_val_.*\\.csv$", full.names = FALSE)
+  if (length(files) == 0) stop("No validation prediction files found in ", OUT_DIR, ". Run train_models.R first.")
 
-if (!val$ok) {
-  message("Validation prediction files not found. Missing:")
-  message(paste0(" - ", val$missing, collapse = "\n"))
-  message("\nFalling back to fitting weights on TEST predictions (not recommended).")
-  use_test_for_fit <- TRUE
+  MODELS <- sub("^pred_val_", "", files)
+  MODELS <- sub("\\.csv$", "", MODELS)
+
+  # Keep only those that also have test files
+  MODELS <- MODELS[file.exists(file.path(OUT_DIR, paste0("pred_test_", MODELS, ".csv")))]
+
+  if (length(MODELS) == 0) stop("No models have both pred_val_ and pred_test_ files.")
 }
 
-test <- read_pred_set(MODELS, "pred_test_")
-if (!test$ok) {
-  stop("Test prediction files missing. Please run train_models.R for each model first. Missing:\n",
-       paste0(test$missing, collapse = "\n"))
-}
-
-fit_set <- if (use_test_for_fit) test else val
-y_fit <- fit_set$y
-P_fit <- fit_set$P
-
-y_test <- test$y
-P_test <- test$P
+cat("Models in ensemble (", length(MODELS), "):\n", paste0(" - ", MODELS, collapse = "\n"), "\n", sep = "")
 
 metric <- metric_fn(OBJECTIVE)
 
 # ----------------------------
-# Grey Wolf Optimizer (GWO) on simplex via softmax parameterization
-# We optimize unconstrained vectors z; weights w = softmax(z)
+# Load aligned validation + test matrices
+# ----------------------------
+val_ok <- TRUE
+val <- NULL
+tryCatch({
+  val <- build_matrix(MODELS, "val")
+}, error = function(e) {
+  val_ok <<- FALSE
+  message("Validation files could not be used: ", conditionMessage(e))
+})
+
+test <- build_matrix(MODELS, "test")
+
+use_test_for_fit <- FALSE
+if (!val_ok) {
+  if (!ALLOW_TEST_FIT_IF_NO_VAL) {
+    stop("Validation predictions unavailable or inconsistent.\n",
+         "Fix pred_val files or set ALLOW_TEST_FIT_IF_NO_VAL=TRUE (NOT recommended).")
+  }
+  message("Falling back to fitting weights on TEST (NOT recommended).")
+  use_test_for_fit <- TRUE
+  val <- test
+}
+
+y_fit <- val$y
+P_fit <- val$P
+y_test <- test$y
+P_test <- test$P
+
+cat("\nAligned sample sizes:\n")
+cat(" - Fit set:", nrow(val$df), "\n")
+cat(" - Test set:", nrow(test$df), "\n")
+
+# ----------------------------
+# Grey Wolf Optimizer in unconstrained space z; weights w=softmax(z)
 # ----------------------------
 D <- length(MODELS)
-
-# Initialize wolves in unconstrained space
 wolves <- matrix(rnorm(N_WOLVES * D, sd = 1), nrow = N_WOLVES, ncol = D)
 
 eval_wolf <- function(z) {
   w <- softmax(z)
-  objective_for_weights(w, y_fit, P_fit, metric)
+  p <- as.numeric(P_fit %*% w)
+  metric(y_fit, p)
 }
 
 fitness <- apply(wolves, 1, eval_wolf)
 
-# Track bests (alpha, beta, delta)
-order_idx <- order(fitness)
-alpha <- wolves[order_idx[1], , drop = FALSE]
-beta  <- wolves[order_idx[2], , drop = FALSE]
-delta <- wolves[order_idx[3], , drop = FALSE]
-alpha_fit <- fitness[order_idx[1]]
+ord <- order(fitness)
+alpha <- wolves[ord[1], , drop = FALSE]
+beta  <- wolves[ord[2], , drop = FALSE]
+delta <- wolves[ord[3], , drop = FALSE]
+alpha_fit <- fitness[ord[1]]
 
 for (t in 1:N_ITERS) {
-  a <- 2 - 2 * (t - 1) / (N_ITERS - 1)  # linearly decreases 2 -> 0
+  a <- 2 - 2 * (t - 1) / max(1, (N_ITERS - 1))
 
   for (i in 1:N_WOLVES) {
-    # Update each dimension using alpha/beta/delta guidance
     for (j in 1:D) {
       r1 <- runif(1); r2 <- runif(1)
       A1 <- 2 * a * r1 - a
@@ -184,15 +224,15 @@ for (t in 1:N_ITERS) {
   }
 
   fitness <- apply(wolves, 1, eval_wolf)
-  order_idx <- order(fitness)
+  ord <- order(fitness)
 
-  alpha <- wolves[order_idx[1], , drop = FALSE]
-  beta  <- wolves[order_idx[2], , drop = FALSE]
-  delta <- wolves[order_idx[3], , drop = FALSE]
-  alpha_fit <- fitness[order_idx[1]]
+  alpha <- wolves[ord[1], , drop = FALSE]
+  beta  <- wolves[ord[2], , drop = FALSE]
+  delta <- wolves[ord[3], , drop = FALSE]
+  alpha_fit <- fitness[ord[1]]
 
-  if (t %% 10 == 0) {
-    message(sprintf("Iter %d/%d | Best %s (fit set): %.6f", t, N_ITERS, OBJECTIVE, alpha_fit))
+  if (t %% 25 == 0) {
+    message(sprintf("Iter %d/%d | Best %s (fit set): %.8f", t, N_ITERS, OBJECTIVE, alpha_fit))
   }
 }
 
@@ -200,7 +240,7 @@ best_w <- softmax(alpha[1, ])
 names(best_w) <- MODELS
 
 # ----------------------------
-# Evaluate ensemble on TEST
+# Evaluate on TEST
 # ----------------------------
 p_ens_test <- as.numeric(P_test %*% best_w)
 
@@ -211,6 +251,7 @@ rmse_test <- sqrt(mse_test)
 ensemble_metrics <- data.frame(
   objective_fit_set = OBJECTIVE,
   used_test_for_fit = use_test_for_fit,
+  n_models = length(MODELS),
   MAE_test = mae_test,
   MSE_test = mse_test,
   RMSE_test = rmse_test
@@ -224,8 +265,9 @@ preds_path   <- file.path(OUT_DIR, "ensemble_predictions_test_gwo.csv")
 write.csv(data.frame(model = MODELS, weight = as.numeric(best_w)), weights_path, row.names = FALSE)
 write.csv(ensemble_metrics, metrics_path, row.names = FALSE)
 
-pred_df <- data.frame(
-  y_true = y_test,
+pred_df <- test$df |> transmute(
+  target_date = target_date,
+  y_true = y_true,
   y_pred_ensemble = p_ens_test
 )
 write.csv(pred_df, preds_path, row.names = FALSE)
@@ -235,7 +277,6 @@ cat("\nSaved files:\n",
     " - ", metrics_path, "\n",
     " - ", preds_path, "\n", sep = "")
 
-# Print weights
 cat("\nBest weights (sum should be 1):\n")
 print(round(best_w, 6))
 cat("Sum weights:", sum(best_w), "\n")
