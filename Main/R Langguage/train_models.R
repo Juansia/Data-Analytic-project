@@ -1,8 +1,7 @@
-# train_models_v2_fixed.R
+# train_models.R
 # ------------------------------------------------------------------------------
 # Data-Driven Evaluation of Brent Crude Oil Forecasting Models (Project-aligned)
 #
-# This script aligns with the methodology described in "final paper 8.pdf":
 # - 3-day-ahead forecasting (HORIZON=3)
 # - Chronological split: 80% train / 10% validation / 10% test
 # - Min–max scaling fit on TRAIN ONLY (prevents leakage)
@@ -11,7 +10,7 @@
 # - Saves per-model validation + test predictions for downstream ensemble weighting
 #
 # OPTIONAL: To mirror the PDF's reproducibility instructions (train one selected model at a time),
-# set MODEL_NAME (e.g., "SENT-Bi-GRU") and run source("train_models_v2_fixed.R").
+# set MODEL_NAME (e.g., "SENT-Bi-GRU") and run source("train_models.R").
 # If MODEL_NAME is NULL, the script will tune/train ALL architectures listed in ARCHITECTURES.
 #
 # Outputs (created under OUT_DIR):
