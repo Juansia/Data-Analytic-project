@@ -1,7 +1,7 @@
-# Data-Analytic-project (R Version) — Data-Driven Evaluation of Brent Crude Oil Forecasting Models
+# Data-Analytic-project — Data-Driven Evaluation of Brent Crude Oil Forecasting Models
 
-An **R-based time-series forecasting framework** for predicting **Brent crude oil closing prices** using **sentiment (SENT)** and **USDX** as optional exogenous inputs.  
-Models are trained in **R** via **keras/TensorFlow**, and an optional **Grey Wolf Optimizer (GWO)** script computes **weighted ensemble** predictions in **R**.
+An **R-based time-series forecasting framework** for predicting **Brent crude oil closing prices** using **sentiment (SENT)** and **USDX** as exogenous inputs.  
+Models are trained in **R** via **keras/TensorFlow**, and using **Grey Wolf Optimizer (GWO)** script computes **weighted ensemble** predictions in **R**.
 
 ---
 
@@ -34,7 +34,7 @@ Main/R Language/
 
 ### Prerequisites
 - R (recommended: 4.2+)
-- RStudio (recommended)
+- RStudio
 - TensorFlow backend (used through R `keras`)
 
 ### Install packages (first run only)
@@ -50,11 +50,10 @@ Install the TensorFlow backend (one-time):
 keras::install_keras()
 ```
 
-> If TensorFlow installation fails, see `keras` installation guidance for your OS and Python setup.
-
----
 
 ## Data Requirements
+
+`The dataset is obtained by following the procedures in the DATA COLLECTION folder`
 
 Place the dataset CSV here:
 
@@ -64,9 +63,7 @@ Place the dataset CSV here:
 - `date` (YYYY-MM-DD)
 - `BRENT Close` (target)
 - `SENT` (sentiment feature)
-
-### Optional column
-- `USDX` (needed only for the USDX+SENT model/feature set)
+- `USDX` 
 
 Your prepared dataset in this repo typically contains additional columns (e.g., `BRENT Volume`, differences, etc.).  
 The scripts will select the needed columns automatically based on the model/feature set.
