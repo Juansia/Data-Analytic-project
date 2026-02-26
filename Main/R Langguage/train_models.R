@@ -1,30 +1,25 @@
-# train_models.R
+# train_models_v2_fixed.R
 # ------------------------------------------------------------------------------
 # Data-Driven Evaluation of Brent Crude Oil Forecasting Models (Project-aligned)
 #
-# What this script does
-# 1) Loads your processed dataset (daily trading days).
-# 2) Chronological split: 80% train / 10% validation / 10% test.
-# 3) Min–max scaling fit on TRAIN ONLY (prevents leakage), applied to all splits.
-# 4) Sliding-window supervised learning:
-#      - Input window length = Time Steps (TS) chosen by tuning (range 3–30)
-#      - Forecast horizon = 3 trading days ahead (HORIZON=3)
-# 5) Hyperparameter tuning with Grey Wolf Optimizer (GWO) to minimize VALIDATION MSE
-#    (measured on ORIGINAL price scale), searching Table-3 space:
-#      - learning rate: 1e-4 … 1e-1 (log-scale)
-#      - hidden units: 2^n, n=1..8  (2..256)
-#      - optimizer: SGD, RMSprop, Adagrad, Adadelta, AdamW, Adam, Adamax
-#      - dropout: 0.2 … 0.5
-#      - time steps: 3 … 30
-#      - external factors: None; USDX; SENT; USDX+SENT
-# 6) Trains the BEST configuration per architecture and saves:
-#      - outputs/best_scores_r.csv (summary metrics + best hyperparams)
-#      - outputs/pred_val_<MODEL>.csv  (validation predictions, with target_date)
-#      - outputs/pred_test_<MODEL>.csv (test predictions, with target_date)
-#      - outputs/best_params_<ARCH>.csv (best hyperparams per architecture)
+# This script aligns with the methodology described in "final paper 8.pdf":
+# - 3-day-ahead forecasting (HORIZON=3)
+# - Chronological split: 80% train / 10% validation / 10% test
+# - Min–max scaling fit on TRAIN ONLY (prevents leakage)
+# - Sliding-window supervised learning with tunable Time Steps (TS) in [3, 30]
+# - Grey Wolf Optimizer (GWO) hyperparameter search to minimize VALIDATION MSE
+# - Saves per-model validation + test predictions for downstream ensemble weighting
 #
-# After running this script for the architectures you want, run gwo_ensemble.R
-# to learn GWO ensemble weights on validation and evaluate on test.
+# OPTIONAL: To mirror the PDF's reproducibility instructions (train one selected model at a time),
+# set MODEL_NAME (e.g., "SENT-Bi-GRU") and run source("train_models_v2_fixed.R").
+# If MODEL_NAME is NULL, the script will tune/train ALL architectures listed in ARCHITECTURES.
+#
+# Outputs (created under OUT_DIR):
+# - best_scores_r.csv (append one row per trained model: metrics + best hyperparams)
+# - pred_val_<MODEL>.csv  (validation predictions with target_date)
+# - pred_test_<MODEL>.csv (test predictions with target_date)
+# - best_params_<ARCH>.csv (best hyperparams per architecture)
+# - gwo_history_<ARCH>.csv (best validation MSE trace over iterations)
 # ------------------------------------------------------------------------------
 
 suppressPackageStartupMessages({
@@ -37,17 +32,32 @@ suppressPackageStartupMessages({
 # ----------------------------
 # CONFIG (EDIT THESE)
 # ----------------------------
-DATA_PATH <- "processed_data_best_corr_sentiment.csv"  # <- set your path
+
+# Path to your final processed CSV (as described in the PDF: saved under Main/R Language/dataset/)
+DATA_PATH <- "processed_data_best_corr_sentiment.csv"  # <-- change if needed
 OUT_DIR   <- "outputs"
 
-# Forecasting setup (project requirement)
+# Column names in your processed CSV (edit if your headers differ)
+COL_DATE  <- NULL                 # if NULL, auto-detect 'date' or 'Date'
+COL_BRENT <- "BRENT Close"        # Brent Close column
+COL_USDX  <- "USDX"               # USDX column
+COL_SENT  <- "SENT"               # Sentiment column (you renamed Csum_CrudeBERT_Plus_GT -> SENT)
+
+# Forecasting setup (paper)
 HORIZON <- 3
 
-# Time split (project requirement)
+# Time split (paper)
 TRAIN_FRAC <- 0.80
 VAL_FRAC   <- 0.10
 
-# Architectures to tune/train
+# OPTIONAL: Train/tune a single model name (PDF suggests doing this iteratively).
+# Examples:
+#   "SENT-Bi-GRU"
+#   "SENT-CNN-Bi-LSTM-Attention"
+#   "SENT-USDX-Encoder-decoder-GRU"
+MODEL_NAME <- NULL
+
+# Architectures to tune/train (paper set)
 ARCHITECTURES <- c(
   "LSTM",
   "GRU",
@@ -63,43 +73,82 @@ ARCHITECTURES <- c(
 # Search space (Table 3)
 FEATURE_SETS <- c("NONE", "USDX", "SENT", "USDX+SENT")
 OPTIMIZERS   <- c("SGD", "RMSprop", "Adagrad", "Adadelta", "AdamW", "Adam", "Adamax")
-HIDDEN_UNITS <- 2^(1:8)  # 2,4,...,256
+HIDDEN_UNITS <- 2^(1:8)  # 2,4,...,256  (matches Table 3)
 
-# Training config
-BATCH_SIZE <- 32
-SEED       <- 42
+# GWO settings (not specified in the PDF; adjust for runtime vs quality)
+N_WOLVES <- 12
+N_ITERS  <- 24
 
-# Make runtime LONG / quality high:
-# Choose: "FAST", "BALANCED", "MAX"
-QUALITY_MODE <- "MAX"
+# Training settings (Appendix Table 7 states: "All models trained for 20 epochs.")
+EPOCHS_TUNE  <- 20
+EPOCHS_FINAL <- 20
+BATCH_SIZE   <- 32
+SEED         <- 42
 
-# Early-stopping (final training only)
-USE_EARLY_STOPPING_FINAL <- TRUE
-ES_PATIENCE_FINAL        <- 25
+# The PDF does not mention early stopping; keep it OFF by default to match.
+USE_EARLY_STOPPING_FINAL <- FALSE
+ES_PATIENCE_FINAL        <- 25  # used only if USE_EARLY_STOPPING_FINAL=TRUE
 
-# Misc
+# Save trained models (optional)
 SAVE_MODELS <- TRUE
 MODEL_DIR   <- file.path(OUT_DIR, "models")
 
 # ----------------------------
-# Derived quality settings
+# Derived (from MODEL_NAME)
 # ----------------------------
-quality_settings <- function(mode) {
-  mode <- toupper(mode)
-  if (mode == "FAST") {
-    return(list(N_WOLVES = 6,  N_ITERS = 12, EPOCHS_TUNE = 12, EPOCHS_FINAL = 80))
+FORCE_FEATURE_SET <- NULL  # if MODEL_NAME is set, we pin feature set to match the prefix
+FORCE_ARCH        <- NULL  # if MODEL_NAME is set, we pin architecture to match the suffix
+
+parse_model_name <- function(model_name) {
+  # Accept prefixes:
+  #   None-<ARCH>, USDX-<ARCH>, SENT-<ARCH>, SENT-USDX-<ARCH>
+  # Map:
+  #   None      -> NONE
+  #   USDX      -> USDX
+  #   SENT      -> SENT
+  #   SENT-USDX -> USDX+SENT
+  model_name <- trimws(model_name)
+
+  if (startsWith(model_name, "SENT-USDX-")) {
+    arch <- sub("^SENT-USDX-", "", model_name)
+    return(list(feature_set = "USDX+SENT", arch = arch))
   }
-  if (mode == "BALANCED") {
-    return(list(N_WOLVES = 10, N_ITERS = 18, EPOCHS_TUNE = 20, EPOCHS_FINAL = 200))
+  if (startsWith(model_name, "SENT-")) {
+    arch <- sub("^SENT-", "", model_name)
+    return(list(feature_set = "SENT", arch = arch))
   }
-  # MAX (default): heavy search + long final training
-  return(list(N_WOLVES = 12, N_ITERS = 24, EPOCHS_TUNE = 20, EPOCHS_FINAL = 400))
+  if (startsWith(model_name, "USDX-")) {
+    arch <- sub("^USDX-", "", model_name)
+    return(list(feature_set = "USDX", arch = arch))
+  }
+  if (startsWith(model_name, "None-") || startsWith(model_name, "NONE-")) {
+    arch <- sub("^(None|NONE)-", "", model_name)
+    return(list(feature_set = "NONE", arch = arch))
+  }
+
+  stop("MODEL_NAME must start with one of: None-, USDX-, SENT-, SENT-USDX-. ",
+       "Got: ", model_name,
+       "\nExamples: 'SENT-Bi-GRU', 'SENT-USDX-Encoder-decoder-GRU'.")
 }
-Q <- quality_settings(QUALITY_MODE)
-N_WOLVES     <- Q$N_WOLVES
-N_ITERS      <- Q$N_ITERS
-EPOCHS_TUNE  <- Q$EPOCHS_TUNE
-EPOCHS_FINAL <- Q$EPOCHS_FINAL
+
+if (!is.null(MODEL_NAME)) {
+  sel <- parse_model_name(MODEL_NAME)
+  FORCE_FEATURE_SET <- sel$feature_set
+  FORCE_ARCH <- sel$arch
+
+  if (!(FORCE_ARCH %in% ARCHITECTURES)) {
+    stop("MODEL_NAME architecture '", FORCE_ARCH, "' is not in ARCHITECTURES.\n",
+         "Available: ", paste(ARCHITECTURES, collapse = ", "))
+  }
+
+  ARCHITECTURES <- c(FORCE_ARCH)
+  cat("MODE: single-model run\n")
+  cat(" - MODEL_NAME:", MODEL_NAME, "\n")
+  cat(" - FORCE_FEATURE_SET:", FORCE_FEATURE_SET, "\n")
+  cat(" - FORCE_ARCH:", FORCE_ARCH, "\n")
+} else {
+  cat("MODE: full run (all ARCHITECTURES)\n")
+}
 
 # ----------------------------
 # Setup output folders
@@ -180,11 +229,11 @@ make_sequences_by_target_range <- function(df_scaled, dates,
 
 feature_cols_for_set <- function(feature_set) {
   feature_set <- toupper(feature_set)
-  base <- c("BRENT Close")
+  base <- c(COL_BRENT)
   if (feature_set == "NONE") return(base)
-  if (feature_set == "USDX") return(c(base, "USDX"))
-  if (feature_set == "SENT") return(c(base, "SENT"))
-  if (feature_set == "USDX+SENT") return(c(base, "USDX", "SENT"))
+  if (feature_set == "USDX") return(c(base, COL_USDX))
+  if (feature_set == "SENT") return(c(base, COL_SENT))
+  if (feature_set == "USDX+SENT") return(c(base, COL_USDX, COL_SENT))
   stop("Unknown FEATURE_SET: ", feature_set)
 }
 
@@ -193,7 +242,7 @@ feature_prefix_for_set <- function(feature_set) {
   if (feature_set == "NONE") return("None")
   if (feature_set == "USDX") return("USDX")
   if (feature_set == "SENT") return("SENT")
-  if (feature_set == "USDX+SENT") return("SENT-USDX")  # matches your paper naming style
+  if (feature_set == "USDX+SENT") return("SENT-USDX")  # matches the PDF's naming
   stop("Unknown FEATURE_SET: ", feature_set)
 }
 
@@ -212,18 +261,15 @@ make_optimizer <- function(name, lr) {
 
   if (nm == "ADAMW") {
     # Try tf.keras AdamW (available in many TF versions).
-    opt <- NULL
     opt <- tryCatch({
       tensorflow::tf$keras$optimizers$AdamW(learning_rate = lr, weight_decay = 1e-4)
     }, error = function(e) NULL)
-
     if (!is.null(opt)) return(opt)
 
-    # Fallback: some TF versions expose it under experimental/legacy.
+    # Fallback: experimental namespace in some TF builds
     opt <- tryCatch({
       tensorflow::tf$keras$optimizers$experimental$AdamW(learning_rate = lr, weight_decay = 1e-4)
     }, error = function(e) NULL)
-
     if (!is.null(opt)) return(opt)
 
     message("WARNING: AdamW not available in this TF build; falling back to Adam.")
@@ -255,9 +301,10 @@ build_model <- function(arch, timesteps, n_features, units, dropout, horizon) {
     return(model)
   }
 
+  # NOTE: Put input_shape on the wrapped layer (more robust across keras versions)
   if (arch == "Bi-LSTM") {
     model <- keras_model_sequential() |>
-      bidirectional(layer_lstm(units = units), input_shape = c(timesteps, n_features)) |>
+      bidirectional(layer_lstm(units = units, input_shape = c(timesteps, n_features))) |>
       layer_dropout(rate = dropout) |>
       layer_dense(units = 1)
     return(model)
@@ -265,7 +312,7 @@ build_model <- function(arch, timesteps, n_features, units, dropout, horizon) {
 
   if (arch == "Bi-GRU") {
     model <- keras_model_sequential() |>
-      bidirectional(layer_gru(units = units), input_shape = c(timesteps, n_features)) |>
+      bidirectional(layer_gru(units = units, input_shape = c(timesteps, n_features))) |>
       layer_dropout(rate = dropout) |>
       layer_dense(units = 1)
     return(model)
@@ -318,9 +365,7 @@ build_model <- function(arch, timesteps, n_features, units, dropout, horizon) {
       tensorflow::tf$reduce_sum(x_seq * a, axis = 1L)
     })
 
-    outputs <- context |>
-      layer_dense(units = 1)
-
+    outputs <- context |> layer_dense(units = 1)
     model <- keras_model(inputs = inputs, outputs = outputs)
     return(model)
   }
@@ -355,7 +400,7 @@ build_model <- function(arch, timesteps, n_features, units, dropout, horizon) {
 # (Mixed discrete/continuous variables via normalized [0,1] positions)
 # ----------------------------
 decode_wolf <- function(pos) {
-  # pos is numeric vector in [0,1] of length 6:
+  # pos in [0,1] of length 6:
   # 1) lr_u, 2) hidden_u, 3) dropout_u, 4) ts_u, 5) opt_u, 6) feat_u
   lr_u     <- pos[1]
   hidden_u <- pos[2]
@@ -367,7 +412,7 @@ decode_wolf <- function(pos) {
   # Learning rate: log-uniform in [1e-4, 1e-1]
   lr <- 10^(log10(1e-4) + lr_u * (log10(1e-1) - log10(1e-4)))
 
-  # Hidden units: pick from powers of 2 list
+  # Hidden units: pick from powers-of-two list (Table 3)
   idx_h <- floor(hidden_u * length(HIDDEN_UNITS)) + 1
   idx_h <- max(1, min(length(HIDDEN_UNITS), idx_h))
   units <- HIDDEN_UNITS[idx_h]
@@ -384,10 +429,14 @@ decode_wolf <- function(pos) {
   idx_o <- max(1, min(length(OPTIMIZERS), idx_o))
   opt <- OPTIMIZERS[idx_o]
 
-  # Feature set: categorical
-  idx_f <- floor(feat_u * length(FEATURE_SETS)) + 1
-  idx_f <- max(1, min(length(FEATURE_SETS), idx_f))
-  feat <- FEATURE_SETS[idx_f]
+  # Feature set: categorical, unless forced by MODEL_NAME mode
+  if (!is.null(FORCE_FEATURE_SET)) {
+    feat <- FORCE_FEATURE_SET
+  } else {
+    idx_f <- floor(feat_u * length(FEATURE_SETS)) + 1
+    idx_f <- max(1, min(length(FEATURE_SETS), idx_f))
+    feat <- FEATURE_SETS[idx_f]
+  }
 
   list(
     lr = lr,
@@ -409,10 +458,12 @@ if (!file.exists(DATA_PATH)) {
 df <- read_csv(DATA_PATH, show_col_types = FALSE)
 
 # Identify date column
-date_col <- NULL
-if ("date" %in% names(df)) date_col <- "date"
-if ("Date" %in% names(df)) date_col <- "Date"
-if (is.null(date_col)) stop("No date column found. Expected a 'date' or 'Date' column.")
+date_col <- COL_DATE
+if (is.null(date_col)) {
+  if ("date" %in% names(df)) date_col <- "date"
+  if ("Date" %in% names(df)) date_col <- "Date"
+}
+if (is.null(date_col)) stop("No date column found. Expected a 'date' or 'Date' column, or set COL_DATE.")
 
 # Sort by date (chronological)
 df[[date_col]] <- as.character(df[[date_col]])
@@ -421,16 +472,16 @@ if (all(!is.na(date_parsed))) {
   df[[date_col]] <- date_parsed
   df <- df |> arrange(.data[[date_col]])
 } else {
-  # fallback: lexicographic
   df <- df |> arrange(.data[[date_col]])
 }
 
 # Required cols for this project
-cols_all <- c("BRENT Close", "USDX", "SENT")
+cols_all <- c(COL_BRENT, COL_USDX, COL_SENT)
 missing_cols <- setdiff(cols_all, names(df))
 if (length(missing_cols) > 0) {
   stop("Missing required columns in CSV: ", paste(missing_cols, collapse = ", "),
-       "\nYour project expects at least: BRENT Close, USDX, SENT.")
+       "\nExpected at least: ", paste(cols_all, collapse = ", "),
+       "\nEdit COL_BRENT/COL_USDX/COL_SENT at the top if your headers differ.")
 }
 
 # Drop rows with NA in required cols
@@ -443,27 +494,28 @@ i_val   <- idx$i_val
 
 cat("Rows:", n, "\nTrain end idx:", i_train, "\nVal end idx:", i_val, "\nTest end idx:", n, "\n")
 
-# Fit scaler ONLY on train portion (project requirement)
+# Fit scaler ONLY on train portion (paper requirement)
 scaler <- minmax_fit(df[1:i_train, ], cols_all)
 
 # Scale full dataset using train scaler
 df_s <- minmax_transform(df, cols_all, scaler)
 
 dates <- df[[date_col]]
-
-TARGET_COL <- "BRENT Close"
+TARGET_COL <- COL_BRENT
 
 # ----------------------------
 # Core evaluation: train config -> validation MSE (original scale)
 # ----------------------------
 eval_config <- function(arch, cfg) {
-  # Ensure required feature columns exist for this feature set
-  features <- feature_cols_for_set(cfg$feature_set)
-  if (!all(features %in% names(df_s))) stop("Missing feature columns in scaled df.")
+  # Fast reject invalid CNN settings (conv+pool needs enough timesteps)
+  # This avoids repeated shape errors during the GWO search.
+  if (grepl("^CNN", arch) && cfg$timesteps < 6) {
+    return(list(val_mse = Inf))
+  }
 
+  features <- feature_cols_for_set(cfg$feature_set)
   lookback <- cfg$timesteps
 
-  # Build sequences (by TARGET index range)
   train_seq <- make_sequences_by_target_range(
     df_s, dates, features, TARGET_COL, lookback, HORIZON,
     target_idx_min = 1, target_idx_max = i_train
@@ -474,11 +526,9 @@ eval_config <- function(arch, cfg) {
     target_idx_min = i_train + 1, target_idx_max = i_val
   )
 
-  # Reset graph/session between runs (helps memory)
   tryCatch({ keras::k_clear_session() }, error = function(e) NULL)
   gc()
 
-  # Reproducibility
   set.seed(SEED)
   tensorflow::tf$random$set_seed(SEED)
 
@@ -489,9 +539,7 @@ eval_config <- function(arch, cfg) {
     loss      = "mse"
   )
 
-  # During tuning: keep output quiet, but still use val monitoring.
-  # NOTE: We do NOT early-stop tuning runs by default (to match paper's fixed-epoch tuning style).
-  history <- model |> fit(
+  model |> fit(
     x = train_seq$X, y = train_seq$y,
     validation_data = list(val_seq$X, val_seq$y),
     epochs = EPOCHS_TUNE,
@@ -518,16 +566,15 @@ gwo_optimize_arch <- function(arch) {
   cat("\n==============================\n")
   cat("GWO tuning architecture:", arch, "\n")
   cat("Wolves:", N_WOLVES, " | Iters:", N_ITERS, " | Tune epochs:", EPOCHS_TUNE, "\n")
+  if (!is.null(FORCE_FEATURE_SET)) cat("Feature set fixed to:", FORCE_FEATURE_SET, "\n")
   cat("==============================\n")
 
   D <- 6  # lr, hidden, dropout, ts, opt, feat
 
-  # Init wolves in [0,1]
   wolves <- matrix(runif(N_WOLVES * D), nrow = N_WOLVES, ncol = D)
 
   eval_pos <- function(pos) {
     cfg <- decode_wolf(pos)
-    # Try-catch so a single bad run doesn't kill the whole optimization
     fit <- tryCatch({
       eval_config(arch, cfg)$val_mse
     }, error = function(e) {
@@ -547,11 +594,12 @@ gwo_optimize_arch <- function(arch) {
 
   best_hist <- data.frame(iter = 0, best_val_mse = alpha_fit)
 
-  no_improve <- 0
+  # Track global best across iterations (GWO fitness is not guaranteed monotonic)
   best_so_far <- alpha_fit
+  best_alpha  <- alpha
 
   for (t in 1:N_ITERS) {
-    a <- 2 - 2 * (t - 1) / max(1, (N_ITERS - 1))  # 2 -> 0
+    a <- 2 - 2 * (t - 1) / max(1, (N_ITERS - 1))
 
     for (i in 1:N_WOLVES) {
       for (j in 1:D) {
@@ -577,7 +625,6 @@ gwo_optimize_arch <- function(arch) {
       }
     }
 
-    # Keep in bounds
     wolves <- pmin(pmax(wolves, 0), 1)
 
     fitness <- apply(wolves, 1, eval_pos)
@@ -588,25 +635,19 @@ gwo_optimize_arch <- function(arch) {
     delta <- wolves[ord[3], , drop = FALSE]
     alpha_fit <- fitness[ord[1]]
 
-    best_hist <- bind_rows(best_hist, data.frame(iter = t, best_val_mse = alpha_fit))
-
     if (alpha_fit + 1e-12 < best_so_far) {
       best_so_far <- alpha_fit
-      no_improve <- 0
-    } else {
-      no_improve <- no_improve + 1
+      best_alpha  <- alpha
     }
+
+    best_hist <- bind_rows(best_hist, data.frame(iter = t, best_val_mse = alpha_fit))
 
     if (t %% 2 == 0) {
       cat(sprintf("Iter %d/%d | best val MSE: %.6f\n", t, N_ITERS, alpha_fit))
     }
-
-    # Practical early-stop on plateau (keeps runtime in check in later iterations).
-    if (QUALITY_MODE != "MAX" && no_improve >= 6) break
-    if (QUALITY_MODE == "MAX" && no_improve >= 10) break
   }
 
-  best_cfg <- decode_wolf(alpha[1, ])
+  best_cfg <- decode_wolf(best_alpha[1, ])
   list(best_cfg = best_cfg, best_val_mse = best_so_far, history = best_hist)
 }
 
@@ -617,7 +658,6 @@ train_and_save_best <- function(arch, cfg, tuned_val_mse) {
   features <- feature_cols_for_set(cfg$feature_set)
   lookback <- cfg$timesteps
 
-  # Sequences
   train_seq <- make_sequences_by_target_range(
     df_s, dates, features, TARGET_COL, lookback, HORIZON,
     target_idx_min = 1, target_idx_max = i_train
@@ -652,12 +692,6 @@ train_and_save_best <- function(arch, cfg, tuned_val_mse) {
         monitor = "val_loss",
         patience = ES_PATIENCE_FINAL,
         restore_best_weights = TRUE
-      ),
-      callback_reduce_lr_on_plateau(
-        monitor = "val_loss",
-        factor = 0.5,
-        patience = max(5, round(ES_PATIENCE_FINAL / 3)),
-        verbose = 0
       )
     )
   }
@@ -668,7 +702,7 @@ train_and_save_best <- function(arch, cfg, tuned_val_mse) {
       " | LR:", sprintf("%.6f", cfg$lr),
       " | Opt:", cfg$optimizer, "\n", sep = "")
 
-  history <- model |> fit(
+  model |> fit(
     x = train_seq$X, y = train_seq$y,
     validation_data = list(val_seq$X, val_seq$y),
     epochs = EPOCHS_FINAL,
@@ -710,16 +744,12 @@ train_and_save_best <- function(arch, cfg, tuned_val_mse) {
   val_out <- data.frame(
     target_date   = as.character(val_seq$target_date),
     target_index  = val_seq$target_index,
-    y_true_scaled = y_val_scaled,
-    y_pred_scaled = pred_val_scaled,
     y_true_orig   = y_val_orig,
     y_pred_orig   = pred_val_orig
   )
   test_out <- data.frame(
     target_date   = as.character(test_seq$target_date),
     target_index  = test_seq$target_index,
-    y_true_scaled = y_test_scaled,
-    y_pred_scaled = pred_test_scaled,
     y_true_orig   = y_test_orig,
     y_pred_orig   = pred_test_orig
   )
@@ -770,20 +800,21 @@ train_and_save_best <- function(arch, cfg, tuned_val_mse) {
 # MAIN: tune + train per architecture
 # ----------------------------
 cat("\n=== TRAIN MODELS (GWO) ===\n")
-cat("QUALITY_MODE:", QUALITY_MODE, "\n")
 cat("HORIZON:", HORIZON, "\n")
 cat("Train/Val/Test:", TRAIN_FRAC, "/", VAL_FRAC, "/", (1 - TRAIN_FRAC - VAL_FRAC), "\n")
+cat("Epochs (tune/final):", EPOCHS_TUNE, "/", EPOCHS_FINAL, "\n")
 
 for (arch in ARCHITECTURES) {
   res <- gwo_optimize_arch(arch)
+
   # Save tuning trace (best validation MSE per iteration)
   tryCatch({
     write.csv(res$history, file.path(OUT_DIR, paste0("gwo_history_", arch, ".csv")), row.names = FALSE)
   }, error = function(e) {
     message("WARN: could not write GWO history: ", conditionMessage(e))
   })
-  best_cfg <- res$best_cfg
 
+  best_cfg <- res$best_cfg
   cat("\nBest for ", arch, ":\n", sep = "")
   print(best_cfg)
   cat("Best tuned validation MSE (orig scale):", res$best_val_mse, "\n")
@@ -791,4 +822,4 @@ for (arch in ARCHITECTURES) {
   train_and_save_best(arch, best_cfg, tuned_val_mse = res$best_val_mse)
 }
 
-cat("\nDONE.\nNext: run gwo_ensemble.R to learn ensemble weights.\n")
+cat("\nDONE.\nNext: run gwo_ensemble_v2_fixed.R to learn ensemble weights.\n")
