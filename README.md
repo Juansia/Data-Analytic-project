@@ -1,110 +1,123 @@
 # Data-Analytic-project (R Version) — Data-Driven Evaluation of Brent Crude Oil Forecasting Models
 
-An R-based time-series forecasting framework for Brent crude oil price prediction using **sentiment (SENT)** and **USDX** as exogenous inputs. The project trains multiple deep-learning architectures in **R** (via `keras`/TensorFlow) and supports a **Grey Wolf Optimizer (GWO)** weighted ensemble in **R**.
+An **R-based time-series forecasting framework** for predicting **Brent crude oil closing prices** using **sentiment (SENT)** and **USDX** as optional exogenous inputs.  
+Models are trained in **R** via **keras/TensorFlow**, and an optional **Grey Wolf Optimizer (GWO)** script computes **weighted ensemble** predictions in **R**.
 
-## 🎯 Overview
+---
 
-This project:
-- Integrates **sentiment (SENT)** with Brent price history for multivariate forecasting
-- Implements multiple deep learning architectures in **R** using `keras` (LSTM/GRU/BiLSTM/BiGRU/CNN hybrids, attention, encoder–decoder)
-- Evaluates models using **MAE, MSE, RMSE**
-- Optionally optimizes **ensemble weights** using an **R implementation of GWO**
+## Overview
 
-## 📋 Table of Contents
-- [Project Structure](#-project-structure)
-- [Installation](#-installation)
-- [Data Requirements](#-data-requirements)
-- [Usage (RStudio)](#-usage-rstudio)
-- [Available Models](#-available-models)
-- [Outputs](#-outputs)
-- [Acknowledgments](#-acknowledgments)
+This repository supports:
+- Multivariate forecasting with **BRENT Close** as the target (3-trading-day-ahead by default)
+- Multiple deep-learning architectures (LSTM/GRU/BiLSTM/BiGRU, CNN hybrids, attention, encoder–decoder)
+- Evaluation using **MAE, MSE, RMSE** (reported on a chronological held-out test split)
+- Optional **GWO**-based ensemble weighting (non-negative weights that sum to 1)
 
-## 📁 Project Structure
+---
 
-R implementation files are located in:
+## Project Structure
+
+All R implementation files are located in:
 
 ```
 Main/R Language/
-├── dataset/
+├── dataset/                      # Input CSV lives here
 │   └── processed_data_best_corr_sentiment.csv
-├── train_models.R     # Train one model; append best scores to outputs/best_scores_r.csv
-├── gwo_ensemble.R               # (Optional) GWO weighted ensemble in R
-└── outputs/                     # Generated outputs (created automatically)
+├── train_models.R                # Train one model; saves metrics + predictions
+├── gwo_ensemble.R                # (Optional) GWO weighted ensemble
+└── outputs/                      # Generated outputs (auto-created)
 ```
 
-## 🚀 Installation
+---
+
+## Installation
 
 ### Prerequisites
-- R (recommended: R 4.2+)
+- R (recommended: 4.2+)
 - RStudio (recommended)
 - TensorFlow backend (used through R `keras`)
 
-### R package setup (first time)
-Install required packages in R:
+### Install packages (first run only)
 
 ```r
-install.packages(c("readr","dplyr"))
+install.packages(c("readr", "dplyr"))
 install.packages("keras")
 ```
 
-Then install the TensorFlow backend (one-time):
+Install the TensorFlow backend (one-time):
 
 ```r
 keras::install_keras()
 ```
 
-## 📊 Data Requirements
+> If TensorFlow installation fails, see `keras` installation guidance for your OS and Python setup.
 
-Place your dataset CSV here:
+---
+
+## Data Requirements
+
+Place the dataset CSV here:
 
 `Main/R Language/dataset/processed_data_best_corr_sentiment.csv`
 
-Required columns:
+### Required columns
+- `date` (YYYY-MM-DD)
 - `BRENT Close` (target)
 - `SENT` (sentiment feature)
 
-Optional column:
-- `USDX` (required only for `SENT-USDX-Encoder-decoder-GRU`)
+### Optional column
+- `USDX` (needed only for the USDX+SENT model/feature set)
 
-Example format:
+Your prepared dataset in this repo typically contains additional columns (e.g., `BRENT Volume`, differences, etc.).  
+The scripts will select the needed columns automatically based on the model/feature set.
+
+Example (minimum) format:
+
 ```csv
-Date,BRENT Close,SENT,USDX
-2023-01-01,82.45,0.65,101.23
-2023-01-02,83.12,0.72,101.15
+date,BRENT Close,SENT,USDX
+2023-01-03,82.45,0.65,101.23
+2023-01-04,83.12,0.72,101.15
 ...
 ```
 
-## 💻 Usage (RStudio)
+---
 
-1) Open the repository folder as an **RStudio Project**.  
-2) Set your working directory to: `Main/R Language/`  
-3) Train models and record best scores.
+## Usage (RStudio)
 
-### Single model training (best-score output only)
-Open `train_models_best_only.R` and set:
-- `MODEL_NAME <- "SENT-Bi-GRU"` (or another model)
-- (optional) `LOOKBACK`, `EPOCHS`, `BATCH_SIZE`
+1. Open the repository folder as an **RStudio Project**.
+2. Set your working directory to:
 
-Run in RStudio:
+   `Main/R Language/`
+
+3. Train models (repeat for each model you want to evaluate).
+
+### Train one model
+
+Open `train_models.R` and set:
+
+- `MODEL_NAME <- "SENT-Bi-GRU"` (example)
+
+Then run:
 
 ```r
 source("train_models.R")
 ```
 
-Repeat for each model you want to evaluate.
+Repeat for each `MODEL_NAME` you want to compare.
 
-### (Optional) Weighted ensemble using GWO
-After training multiple models, run:
+### (Optional) Run the GWO ensemble
+
+After you have trained multiple models (so prediction CSVs exist in `outputs/`), run:
 
 ```r
 source("gwo_ensemble.R")
 ```
 
-Edit `MODELS <- c(...)` inside `gwo_ensemble.R` to match the models you trained.
+---
 
-## 🤖 Available Models
+## Available Models
 
-Set `MODEL_NAME` in `train_models.R` to one of:
+Set `MODEL_NAME` in `train_models.R` to one of the following:
 
 - `SENT-LSTM`
 - `SENT-GRU`
@@ -116,23 +129,35 @@ Set `MODEL_NAME` in `train_models.R` to one of:
 - `SENT-Encoder-decoder-LSTM`
 - `SENT-USDX-Encoder-decoder-GRU`
 
-## 📈 Outputs
+---
+
+## Outputs
 
 All outputs are saved under:
 
 `Main/R Language/outputs/`
 
-### From `train_models_best_only.R`
+### From `train_models.R`
 - `best_scores_r.csv`  
-  Appends one row per run with:
-  - `MAE`, `MSE`, `RMSE` (original Brent price scale)
-  - plus configuration fields like `model`, `features`, `lookback`, `horizon`
+  Appends one row per run with summary performance metrics (MAE, MSE, RMSE) and configuration fields.
+- `pred_val_<MODEL>.csv` and `pred_test_<MODEL>.csv`  
+  Per-sample predictions used by the ensemble script. Includes `target_date`, `y_true_orig`, and `y_pred_orig`.
 
 ### From `gwo_ensemble.R` (optional)
-- `best_ensemble_weights_gwo.csv`
-- `ensemble_metrics_gwo.csv`
-- `ensemble_predictions_test_gwo.csv`
+- `best_ensemble_weights_gwo.csv` — learned weights per model
+- `ensemble_metrics_gwo.csv` — ensemble MAE/MSE/RMSE on the test set
+- `ensemble_predictions_test_gwo.csv` — per-sample test predictions from the ensemble
 
-## 🙏 Acknowledgments
-- R `keras` / TensorFlow for deep learning in R
+---
+
+## Notes for Reproducibility
+
+- The scripts use **chronological splits** (no shuffling) and **fit scaling on training only** to reduce data leakage.
+- If you change hyperparameters (epochs, lookback, search settings), document the settings you used when reporting results.
+
+---
+
+## Acknowledgments
+
+- `keras` / TensorFlow for deep learning in R
 - Grey Wolf Optimizer (GWO) metaheuristic approach for ensemble weight optimization
