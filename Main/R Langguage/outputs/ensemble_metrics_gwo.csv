@@ -1,0 +1,2 @@
+objective_fit_set,used_test_for_fit,n_models,MAE_test,MSE_test,RMSE_test
+MSE,False,5,0.21453,0.85321,0.92372

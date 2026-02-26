@@ -1,0 +1,2 @@
+architecture,model_id,feature_set,timesteps,lr,dropout,hidden_units,optimizer,tuned_val_mse,val_MAE,val_MSE,val_RMSE,test_MAE,test_MSE,test_RMSE
+GRU,SENT-GRU,SENT,6,0.01,0.4892,16,AdamW,1.66532,0.29329,1.66532,1.29047,0.29329,1.66532,1.29047

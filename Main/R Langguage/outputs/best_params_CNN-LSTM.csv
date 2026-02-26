@@ -1,0 +1,2 @@
+architecture,model_id,feature_set,timesteps,lr,dropout,hidden_units,optimizer,tuned_val_mse,val_MAE,val_MSE,val_RMSE,test_MAE,test_MSE,test_RMSE
+CNN-LSTM,SENT-CNN-LSTM,SENT,20,0.0075,0.2352,64,SGD,2.43452,0.30273,2.43452,1.56029,0.30273,2.43452,1.56029

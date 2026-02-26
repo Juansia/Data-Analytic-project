@@ -1,0 +1,2 @@
+architecture,model_id,feature_set,timesteps,lr,dropout,hidden_units,optimizer,tuned_val_mse,val_MAE,val_MSE,val_RMSE,test_MAE,test_MSE,test_RMSE
+CNN-Bi-LSTM,SENT-CNN-Bi-LSTM,SENT,14,0.0062,0.3124,32,Adagrad,1.37542,0.26074,1.37542,1.17278,0.26074,1.37542,1.17278

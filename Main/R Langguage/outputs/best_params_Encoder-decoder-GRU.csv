@@ -1,0 +1,2 @@
+architecture,model_id,feature_set,timesteps,lr,dropout,hidden_units,optimizer,tuned_val_mse,val_MAE,val_MSE,val_RMSE,test_MAE,test_MSE,test_RMSE
+Encoder-decoder-GRU,SENT-USDX-Encoder-decoder-GRU,USDX+SENT,18,0.0085,0.3842,16,AdamW,1.27092,0.24773,1.27092,1.12735,0.24773,1.27092,1.12735

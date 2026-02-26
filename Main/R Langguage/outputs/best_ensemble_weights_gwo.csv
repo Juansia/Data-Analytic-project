@@ -1,0 +1,6 @@
+model,weight
+SENT-Bi-LSTM,0.3215
+SENT-Bi-GRU,0.4105
+SENT-CNN-Bi-LSTM,0.0524
+SENT-CNN-Bi-LSTM-Attention,0.1658
+SENT-USDX-Encoder-decoder-LSTM,0.0498

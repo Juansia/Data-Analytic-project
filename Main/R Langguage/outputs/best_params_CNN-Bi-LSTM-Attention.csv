@@ -1,0 +1,2 @@
+architecture,model_id,feature_set,timesteps,lr,dropout,hidden_units,optimizer,tuned_val_mse,val_MAE,val_MSE,val_RMSE,test_MAE,test_MSE,test_RMSE
+CNN-Bi-LSTM-Attention,SENT-CNN-Bi-LSTM-Attention,SENT,23,0.0058,0.4152,64,RMSprop,1.19112,0.23695,1.19112,1.09138,0.23695,1.19112,1.09138

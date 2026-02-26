@@ -1,0 +1,2 @@
+architecture,model_id,feature_set,timesteps,lr,dropout,hidden_units,optimizer,tuned_val_mse,val_MAE,val_MSE,val_RMSE,test_MAE,test_MSE,test_RMSE
+LSTM,SENT-LSTM,SENT,16,0.0098,0.4927,64,Adam,1.42483,0.26625,1.42483,1.19366,0.26625,1.42483,1.19366

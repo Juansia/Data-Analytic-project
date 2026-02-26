@@ -1,0 +1,2 @@
+architecture,model_id,feature_set,timesteps,lr,dropout,hidden_units,optimizer,tuned_val_mse,val_MAE,val_MSE,val_RMSE,test_MAE,test_MSE,test_RMSE
+Encoder-decoder-LSTM,SENT-Encoder-decoder-LSTM,SENT,21,0.0071,0.3678,32,Adam,1.6124,0.29856,1.6124,1.2698,0.29856,1.6124,1.2698
