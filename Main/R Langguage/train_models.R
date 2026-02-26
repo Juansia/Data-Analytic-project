@@ -1,18 +1,31 @@
 # train_models.R
-# R-only implementation (keras/TensorFlow) for Brent 3-day-ahead forecasting with SENT (and optional USDX).
-# OUTPUT MODE: BEST SCORE ONLY
-# - Appends results into outputs/best_scores_r.csv
+# ------------------------------------------------------------------------------
+# Data-Driven Evaluation of Brent Crude Oil Forecasting Models (Project-aligned)
 #
-# Supported MODEL_NAME values:
-#  - SENT-LSTM
-#  - SENT-GRU
-#  - SENT-Bi-LSTM
-#  - SENT-Bi-GRU
-#  - SENT-CNN-LSTM                 (keras substitute for "Torch CNN-LSTM")
-#  - SENT-CNN-Bi-LSTM
-#  - SENT-CNN-Bi-LSTM-Attention
-#  - SENT-Encoder-decoder-LSTM
-#  - SENT-USDX-Encoder-decoder-GRU
+# What this script does
+# 1) Loads your processed dataset (daily trading days).
+# 2) Chronological split: 80% train / 10% validation / 10% test.
+# 3) Min–max scaling fit on TRAIN ONLY (prevents leakage), applied to all splits.
+# 4) Sliding-window supervised learning:
+#      - Input window length = Time Steps (TS) chosen by tuning (range 3–30)
+#      - Forecast horizon = 3 trading days ahead (HORIZON=3)
+# 5) Hyperparameter tuning with Grey Wolf Optimizer (GWO) to minimize VALIDATION MSE
+#    (measured on ORIGINAL price scale), searching Table-3 space:
+#      - learning rate: 1e-4 … 1e-1 (log-scale)
+#      - hidden units: 2^n, n=1..8  (2..256)
+#      - optimizer: SGD, RMSprop, Adagrad, Adadelta, AdamW, Adam, Adamax
+#      - dropout: 0.2 … 0.5
+#      - time steps: 3 … 30
+#      - external factors: None; USDX; SENT; USDX+SENT
+# 6) Trains the BEST configuration per architecture and saves:
+#      - outputs/best_scores_r.csv (summary metrics + best hyperparams)
+#      - outputs/pred_val_<MODEL>.csv  (validation predictions, with target_date)
+#      - outputs/pred_test_<MODEL>.csv (test predictions, with target_date)
+#      - outputs/best_params_<ARCH>.csv (best hyperparams per architecture)
+#
+# After running this script for the architectures you want, run gwo_ensemble.R
+# to learn GWO ensemble weights on validation and evaluate on test.
+# ------------------------------------------------------------------------------
 
 suppressPackageStartupMessages({
   library(readr)
@@ -22,36 +35,85 @@ suppressPackageStartupMessages({
 })
 
 # ----------------------------
-# CONFIG (edit these)
+# CONFIG (EDIT THESE)
 # ----------------------------
-DATA_PATH  <- "dataset/processed_data_best_corr_sentiment.csv"
-MODEL_NAME <- "SENT-Bi-GRU"
-HORIZON    <- 3
-LOOKBACK   <- 30
-EPOCHS     <- 30
+DATA_PATH <- "processed_data_best_corr_sentiment.csv"  # <- set your path
+OUT_DIR   <- "outputs"
+
+# Forecasting setup (project requirement)
+HORIZON <- 3
+
+# Time split (project requirement)
+TRAIN_FRAC <- 0.80
+VAL_FRAC   <- 0.10
+
+# Architectures to tune/train
+ARCHITECTURES <- c(
+  "LSTM",
+  "GRU",
+  "Bi-LSTM",
+  "Bi-GRU",
+  "CNN-LSTM",
+  "CNN-Bi-LSTM",
+  "CNN-Bi-LSTM-Attention",
+  "Encoder-decoder-LSTM",
+  "Encoder-decoder-GRU"
+)
+
+# Search space (Table 3)
+FEATURE_SETS <- c("NONE", "USDX", "SENT", "USDX+SENT")
+OPTIMIZERS   <- c("SGD", "RMSprop", "Adagrad", "Adadelta", "AdamW", "Adam", "Adamax")
+HIDDEN_UNITS <- 2^(1:8)  # 2,4,...,256
+
+# Training config
 BATCH_SIZE <- 32
 SEED       <- 42
 
-# Where to save results (only best scores)
-OUT_DIR <- "outputs"
+# Make runtime LONG / quality high:
+# Choose: "FAST", "BALANCED", "MAX"
+QUALITY_MODE <- "MAX"
+
+# Early-stopping (final training only)
+USE_EARLY_STOPPING_FINAL <- TRUE
+ES_PATIENCE_FINAL        <- 25
+
+# Misc
+SAVE_MODELS <- TRUE
+MODEL_DIR   <- file.path(OUT_DIR, "models")
+
+# ----------------------------
+# Derived quality settings
+# ----------------------------
+quality_settings <- function(mode) {
+  mode <- toupper(mode)
+  if (mode == "FAST") {
+    return(list(N_WOLVES = 6,  N_ITERS = 12, EPOCHS_TUNE = 12, EPOCHS_FINAL = 80))
+  }
+  if (mode == "BALANCED") {
+    return(list(N_WOLVES = 10, N_ITERS = 18, EPOCHS_TUNE = 20, EPOCHS_FINAL = 200))
+  }
+  # MAX (default): heavy search + long final training
+  return(list(N_WOLVES = 12, N_ITERS = 24, EPOCHS_TUNE = 20, EPOCHS_FINAL = 400))
+}
+Q <- quality_settings(QUALITY_MODE)
+N_WOLVES     <- Q$N_WOLVES
+N_ITERS      <- Q$N_ITERS
+EPOCHS_TUNE  <- Q$EPOCHS_TUNE
+EPOCHS_FINAL <- Q$EPOCHS_FINAL
+
+# ----------------------------
+# Setup output folders
+# ----------------------------
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(MODEL_DIR, showWarnings = FALSE, recursive = TRUE)
+
 BEST_SCORES_FILE <- file.path(OUT_DIR, "best_scores_r.csv")
 
 set.seed(SEED)
 tensorflow::tf$random$set_seed(SEED)
 
 # ----------------------------
-# Feature sets by model name
-# ----------------------------
-get_features_for_model <- function(model_name) {
-  if (model_name == "SENT-USDX-Encoder-decoder-GRU") {
-    return(c("BRENT Close", "SENT", "USDX"))
-  }
-  return(c("BRENT Close", "SENT"))
-}
-
-# ----------------------------
-# Helpers
+# Helpers: scaling, metrics, sequences
 # ----------------------------
 minmax_fit <- function(df, cols) {
   mn <- sapply(df[cols], min, na.rm = TRUE)
@@ -67,39 +129,8 @@ minmax_transform <- function(df, cols, scaler) {
   out
 }
 
-minmax_inverse_one <- function(x, col, scaler) {
+minmax_inverse_vec <- function(x, col, scaler) {
   x * (scaler$max[[col]] - scaler$min[[col]] + 1e-9) + scaler$min[[col]]
-}
-
-split_chrono <- function(df, train_frac = 0.8, val_frac = 0.1) {
-  n <- nrow(df)
-  i_train <- floor(train_frac * n)
-  i_val   <- floor((train_frac + val_frac) * n)
-  list(
-    train = df[1:i_train, ],
-    val   = df[(i_train + 1):i_val, ],
-    test  = df[(i_val + 1):n, ]
-  )
-}
-
-make_sequences <- function(df, feature_cols, target_col, lookback, horizon) {
-  X_list <- list()
-  y_list <- c()
-
-  n <- nrow(df)
-  last_start <- n - lookback - horizon + 1
-  if (last_start < 1) stop("Not enough rows for lookback + horizon. Reduce LOOKBACK or add more data.")
-
-  for (i in 1:last_start) {
-    x_win <- as.matrix(df[i:(i + lookback - 1), feature_cols, drop = FALSE])
-    y_val <- df[[target_col]][i + lookback + horizon - 1]
-    X_list[[length(X_list) + 1]] <- x_win
-    y_list <- c(y_list, y_val)
-  }
-
-  X <- array(unlist(X_list), dim = c(length(X_list), lookback, length(feature_cols)))
-  y <- array(y_list, dim = c(length(y_list), 1))
-  list(X = X, y = y)
 }
 
 metrics <- function(y_true, y_pred) {
@@ -111,222 +142,653 @@ metrics <- function(y_true, y_pred) {
   c(MAE = mae, MSE = mse, RMSE = rmse)
 }
 
+split_indices <- function(n, train_frac, val_frac) {
+  i_train <- floor(train_frac * n)
+  i_val   <- floor((train_frac + val_frac) * n)
+  list(i_train = i_train, i_val = i_val)
+}
+
+# Make sliding-window sequences across the FULL series and then select by TARGET index range.
+# This avoids losing the early validation/test targets due to split boundaries.
+make_sequences_by_target_range <- function(df_scaled, dates,
+                                          feature_cols, target_col,
+                                          lookback, horizon,
+                                          target_idx_min, target_idx_max) {
+  n <- nrow(df_scaled)
+  last_start <- n - lookback - horizon + 1
+  if (last_start < 1) stop("Not enough rows for lookback + horizon. Reduce TS or add data.")
+
+  target_idx_all <- (1:last_start) + lookback + horizon - 1
+  keep <- which(target_idx_all >= target_idx_min & target_idx_all <= target_idx_max)
+
+  m <- length(keep)
+  if (m < 5) stop("Too few samples in this split after sequencing (m=", m, "). Try smaller TS.")
+
+  n_features <- length(feature_cols)
+  X <- array(0, dim = c(m, lookback, n_features))
+  y <- array(0, dim = c(m, 1))
+  t_dates <- dates[target_idx_all[keep]]
+
+  for (k in seq_along(keep)) {
+    i <- keep[k]
+    X[k, , ] <- as.matrix(df_scaled[i:(i + lookback - 1), feature_cols, drop = FALSE])
+    y[k, 1]  <- df_scaled[[target_col]][i + lookback + horizon - 1]
+  }
+
+  list(X = X, y = y, target_date = t_dates, target_index = target_idx_all[keep])
+}
+
+feature_cols_for_set <- function(feature_set) {
+  feature_set <- toupper(feature_set)
+  base <- c("BRENT Close")
+  if (feature_set == "NONE") return(base)
+  if (feature_set == "USDX") return(c(base, "USDX"))
+  if (feature_set == "SENT") return(c(base, "SENT"))
+  if (feature_set == "USDX+SENT") return(c(base, "USDX", "SENT"))
+  stop("Unknown FEATURE_SET: ", feature_set)
+}
+
+feature_prefix_for_set <- function(feature_set) {
+  feature_set <- toupper(feature_set)
+  if (feature_set == "NONE") return("None")
+  if (feature_set == "USDX") return("USDX")
+  if (feature_set == "SENT") return("SENT")
+  if (feature_set == "USDX+SENT") return("SENT-USDX")  # matches your paper naming style
+  stop("Unknown FEATURE_SET: ", feature_set)
+}
+
 # ----------------------------
-# Model builders
+# Optimizer factory (robust AdamW)
 # ----------------------------
-build_sent_lstm <- function(timesteps, n_features) {
-  keras_model_sequential() |>
-    layer_lstm(units = 64, input_shape = c(timesteps, n_features)) |>
-    layer_dense(units = 32, activation = "relu") |>
-    layer_dense(units = 1)
+make_optimizer <- function(name, lr) {
+  nm <- toupper(name)
+
+  if (nm == "SGD")      return(optimizer_sgd(learning_rate = lr))
+  if (nm == "RMSPROP")  return(optimizer_rmsprop(learning_rate = lr))
+  if (nm == "ADAGRAD")  return(optimizer_adagrad(learning_rate = lr))
+  if (nm == "ADADELTA") return(optimizer_adadelta(learning_rate = lr))
+  if (nm == "ADAM")     return(optimizer_adam(learning_rate = lr))
+  if (nm == "ADAMAX")   return(optimizer_adamax(learning_rate = lr))
+
+  if (nm == "ADAMW") {
+    # Try tf.keras AdamW (available in many TF versions).
+    opt <- NULL
+    opt <- tryCatch({
+      tensorflow::tf$keras$optimizers$AdamW(learning_rate = lr, weight_decay = 1e-4)
+    }, error = function(e) NULL)
+
+    if (!is.null(opt)) return(opt)
+
+    # Fallback: some TF versions expose it under experimental/legacy.
+    opt <- tryCatch({
+      tensorflow::tf$keras$optimizers$experimental$AdamW(learning_rate = lr, weight_decay = 1e-4)
+    }, error = function(e) NULL)
+
+    if (!is.null(opt)) return(opt)
+
+    message("WARNING: AdamW not available in this TF build; falling back to Adam.")
+    return(optimizer_adam(learning_rate = lr))
+  }
+
+  stop("Unknown optimizer: ", name)
 }
 
-build_sent_gru <- function(timesteps, n_features) {
-  keras_model_sequential() |>
-    layer_gru(units = 64, input_shape = c(timesteps, n_features)) |>
-    layer_dense(units = 32, activation = "relu") |>
-    layer_dense(units = 1)
-}
+# ----------------------------
+# Model builders (parameterized by hidden units + dropout)
+# ----------------------------
+build_model <- function(arch, timesteps, n_features, units, dropout, horizon) {
+  arch <- as.character(arch)
 
-build_sent_bi_lstm <- function(timesteps, n_features) {
-  keras_model_sequential() |>
-    bidirectional(layer_lstm(units = 64), input_shape = c(timesteps, n_features)) |>
-    layer_dense(units = 32, activation = "relu") |>
-    layer_dense(units = 1)
-}
+  if (arch == "LSTM") {
+    model <- keras_model_sequential() |>
+      layer_lstm(units = units, input_shape = c(timesteps, n_features)) |>
+      layer_dropout(rate = dropout) |>
+      layer_dense(units = 1)
+    return(model)
+  }
 
-build_sent_bi_gru <- function(timesteps, n_features) {
-  keras_model_sequential() |>
-    bidirectional(layer_gru(units = 64), input_shape = c(timesteps, n_features)) |>
-    layer_dense(units = 32, activation = "relu") |>
-    layer_dense(units = 1)
-}
+  if (arch == "GRU") {
+    model <- keras_model_sequential() |>
+      layer_gru(units = units, input_shape = c(timesteps, n_features)) |>
+      layer_dropout(rate = dropout) |>
+      layer_dense(units = 1)
+    return(model)
+  }
 
-build_sent_cnn_lstm <- function(timesteps, n_features) {
-  keras_model_sequential() |>
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu",
-                  input_shape = c(timesteps, n_features)) |>
-    layer_max_pooling_1d(pool_size = 2) |>
-    layer_lstm(units = 64) |>
-    layer_dense(units = 1)
-}
+  if (arch == "Bi-LSTM") {
+    model <- keras_model_sequential() |>
+      bidirectional(layer_lstm(units = units), input_shape = c(timesteps, n_features)) |>
+      layer_dropout(rate = dropout) |>
+      layer_dense(units = 1)
+    return(model)
+  }
 
-build_sent_cnn_bi_lstm <- function(timesteps, n_features) {
-  keras_model_sequential() |>
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu",
-                  input_shape = c(timesteps, n_features)) |>
-    layer_max_pooling_1d(pool_size = 2) |>
-    bidirectional(layer_lstm(units = 64)) |>
-    layer_dense(units = 32, activation = "relu") |>
-    layer_dense(units = 1)
-}
+  if (arch == "Bi-GRU") {
+    model <- keras_model_sequential() |>
+      bidirectional(layer_gru(units = units), input_shape = c(timesteps, n_features)) |>
+      layer_dropout(rate = dropout) |>
+      layer_dense(units = 1)
+    return(model)
+  }
 
-build_sent_cnn_bi_lstm_attention <- function(timesteps, n_features) {
-  inputs <- layer_input(shape = c(timesteps, n_features))
+  if (arch == "CNN-LSTM") {
+    model <- keras_model_sequential() |>
+      layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu",
+                    input_shape = c(timesteps, n_features)) |>
+      layer_max_pooling_1d(pool_size = 2) |>
+      layer_lstm(units = units) |>
+      layer_dropout(rate = dropout) |>
+      layer_dense(units = 1)
+    return(model)
+  }
 
-  x <- inputs |>
-    layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu") |>
-    layer_max_pooling_1d(pool_size = 2) |>
-    bidirectional(layer_lstm(units = 64, return_sequences = TRUE))
+  if (arch == "CNN-Bi-LSTM") {
+    model <- keras_model_sequential() |>
+      layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu",
+                    input_shape = c(timesteps, n_features)) |>
+      layer_max_pooling_1d(pool_size = 2) |>
+      bidirectional(layer_lstm(units = units)) |>
+      layer_dropout(rate = dropout) |>
+      layer_dense(units = 1)
+    return(model)
+  }
 
-  score <- x |>
-    layer_dense(units = 1, activation = "tanh")
+  if (arch == "CNN-Bi-LSTM-Attention") {
+    inputs <- layer_input(shape = c(timesteps, n_features))
 
-  attn_weights <- score |>
-    layer_lambda(function(s) {
-      e <- tf$squeeze(s, axis = -1L)
-      a <- tf$nn$softmax(e, axis = -1L)
-      tf$expand_dims(a, axis = -1L)
+    x <- inputs |>
+      layer_conv_1d(filters = 32, kernel_size = 3, activation = "relu") |>
+      layer_max_pooling_1d(pool_size = 2) |>
+      bidirectional(layer_lstm(units = units, return_sequences = TRUE)) |>
+      layer_dropout(rate = dropout)
+
+    # Simple learned attention over timesteps
+    score <- x |> layer_dense(units = 1, activation = "tanh")
+
+    attn_weights <- score |>
+      layer_lambda(function(s) {
+        e <- tensorflow::tf$squeeze(s, axis = -1L)
+        a <- tensorflow::tf$nn$softmax(e, axis = -1L)
+        tensorflow::tf$expand_dims(a, axis = -1L)
+      })
+
+    context <- layer_lambda(list(x, attn_weights), function(z) {
+      x_seq <- z[[1]]
+      a     <- z[[2]]
+      tensorflow::tf$reduce_sum(x_seq * a, axis = 1L)
     })
 
-  context <- layer_lambda(list(x, attn_weights), function(z) {
-    x_seq <- z[[1]]
-    a     <- z[[2]]
-    tf$reduce_sum(x_seq * a, axis = 1L)
-  })
+    outputs <- context |>
+      layer_dense(units = 1)
 
-  outputs <- context |>
-    layer_dense(units = 32, activation = "relu") |>
-    layer_dense(units = 1)
+    model <- keras_model(inputs = inputs, outputs = outputs)
+    return(model)
+  }
 
-  keras_model(inputs = inputs, outputs = outputs)
+  if (arch == "Encoder-decoder-LSTM") {
+    inputs  <- layer_input(shape = c(timesteps, n_features))
+    encoded <- inputs |> layer_lstm(units = units)
+    encoded <- encoded |> layer_dropout(rate = dropout)
+    dec_in  <- encoded |> layer_repeat_vector(horizon)
+    decoded <- dec_in |> layer_lstm(units = units)
+    outputs <- decoded |> layer_dense(units = 1)
+    model <- keras_model(inputs, outputs)
+    return(model)
+  }
+
+  if (arch == "Encoder-decoder-GRU") {
+    inputs  <- layer_input(shape = c(timesteps, n_features))
+    encoded <- inputs |> layer_gru(units = units)
+    encoded <- encoded |> layer_dropout(rate = dropout)
+    dec_in  <- encoded |> layer_repeat_vector(horizon)
+    decoded <- dec_in |> layer_gru(units = units)
+    outputs <- decoded |> layer_dense(units = 1)
+    model <- keras_model(inputs, outputs)
+    return(model)
+  }
+
+  stop("Unknown architecture: ", arch)
 }
 
-build_encoder_decoder_lstm <- function(timesteps, n_features, horizon) {
-  inputs <- layer_input(shape = c(timesteps, n_features))
-  encoded <- inputs |> layer_lstm(units = 64)
-  dec_in  <- encoded |> layer_repeat_vector(horizon)
-  decoded <- dec_in |> layer_lstm(units = 64)
-  outputs <- decoded |> layer_dense(units = 1)
-  keras_model(inputs, outputs)
-}
+# ----------------------------
+# GWO: decode wolf positions -> hyperparameters
+# (Mixed discrete/continuous variables via normalized [0,1] positions)
+# ----------------------------
+decode_wolf <- function(pos) {
+  # pos is numeric vector in [0,1] of length 6:
+  # 1) lr_u, 2) hidden_u, 3) dropout_u, 4) ts_u, 5) opt_u, 6) feat_u
+  lr_u     <- pos[1]
+  hidden_u <- pos[2]
+  drop_u   <- pos[3]
+  ts_u     <- pos[4]
+  opt_u    <- pos[5]
+  feat_u   <- pos[6]
 
-build_encoder_decoder_gru <- function(timesteps, n_features, horizon) {
-  inputs <- layer_input(shape = c(timesteps, n_features))
-  encoded <- inputs |> layer_gru(units = 64)
-  dec_in  <- encoded |> layer_repeat_vector(horizon)
-  decoded <- dec_in |> layer_gru(units = 64)
-  outputs <- decoded |> layer_dense(units = 1)
-  keras_model(inputs, outputs)
-}
+  # Learning rate: log-uniform in [1e-4, 1e-1]
+  lr <- 10^(log10(1e-4) + lr_u * (log10(1e-1) - log10(1e-4)))
 
-get_model <- function(model_name, timesteps, n_features, horizon) {
-  switch(model_name,
-         "SENT-LSTM" = build_sent_lstm(timesteps, n_features),
-         "SENT-GRU" = build_sent_gru(timesteps, n_features),
-         "SENT-Bi-LSTM" = build_sent_bi_lstm(timesteps, n_features),
-         "SENT-Bi-GRU" = build_sent_bi_gru(timesteps, n_features),
-         "SENT-CNN-LSTM" = build_sent_cnn_lstm(timesteps, n_features),
-         "SENT-CNN-Bi-LSTM" = build_sent_cnn_bi_lstm(timesteps, n_features),
-         "SENT-CNN-Bi-LSTM-Attention" = build_sent_cnn_bi_lstm_attention(timesteps, n_features),
-         "SENT-Encoder-decoder-LSTM" = build_encoder_decoder_lstm(timesteps, n_features, horizon),
-         "SENT-USDX-Encoder-decoder-GRU" = build_encoder_decoder_gru(timesteps, n_features, horizon),
-         stop("Unknown MODEL_NAME: ", model_name)
+  # Hidden units: pick from powers of 2 list
+  idx_h <- floor(hidden_u * length(HIDDEN_UNITS)) + 1
+  idx_h <- max(1, min(length(HIDDEN_UNITS), idx_h))
+  units <- HIDDEN_UNITS[idx_h]
+
+  # Dropout: uniform [0.2, 0.5]
+  dropout <- 0.2 + drop_u * (0.5 - 0.2)
+
+  # Time steps: integer [3, 30]
+  ts <- round(3 + ts_u * (30 - 3))
+  ts <- max(3, min(30, ts))
+
+  # Optimizer: categorical
+  idx_o <- floor(opt_u * length(OPTIMIZERS)) + 1
+  idx_o <- max(1, min(length(OPTIMIZERS), idx_o))
+  opt <- OPTIMIZERS[idx_o]
+
+  # Feature set: categorical
+  idx_f <- floor(feat_u * length(FEATURE_SETS)) + 1
+  idx_f <- max(1, min(length(FEATURE_SETS), idx_f))
+  feat <- FEATURE_SETS[idx_f]
+
+  list(
+    lr = lr,
+    units = units,
+    dropout = dropout,
+    timesteps = ts,
+    optimizer = opt,
+    feature_set = feat
   )
 }
 
 # ----------------------------
-# Load data
+# Load + prepare data
 # ----------------------------
 if (!file.exists(DATA_PATH)) {
-  stop("Dataset not found at: ", DATA_PATH,
-       "\nPlace your CSV at dataset/processed_data_best_corr_sentiment.csv or edit DATA_PATH.")
+  stop("Dataset not found at: ", DATA_PATH, "\nEdit DATA_PATH at the top of this file.")
 }
 
 df <- read_csv(DATA_PATH, show_col_types = FALSE)
-if ("Date" %in% names(df)) df <- df |> arrange(Date)
 
-features <- get_features_for_model(MODEL_NAME)
-target   <- "BRENT Close"
+# Identify date column
+date_col <- NULL
+if ("date" %in% names(df)) date_col <- "date"
+if ("Date" %in% names(df)) date_col <- "Date"
+if (is.null(date_col)) stop("No date column found. Expected a 'date' or 'Date' column.")
 
-need_cols <- unique(c(features, target))
-missing_cols <- setdiff(need_cols, names(df))
-if (length(missing_cols) > 0) {
-  stop("Missing required columns: ", paste(missing_cols, collapse = ", "),
-       "\nEdit get_features_for_model() or rename columns in the CSV.")
-}
-
-# ----------------------------
-# Split + scale (train only)
-# ----------------------------
-splits <- split_chrono(df, 0.8, 0.1)
-scaler <- minmax_fit(splits$train, cols = need_cols)
-
-train_s <- minmax_transform(splits$train, cols = need_cols, scaler)
-val_s   <- minmax_transform(splits$val,   cols = need_cols, scaler)
-test_s  <- minmax_transform(splits$test,  cols = need_cols, scaler)
-
-# ----------------------------
-# Build sequences
-# ----------------------------
-train_seq <- make_sequences(train_s, features, target, LOOKBACK, HORIZON)
-val_seq   <- make_sequences(val_s,   features, target, LOOKBACK, HORIZON)
-test_seq  <- make_sequences(test_s,  features, target, LOOKBACK, HORIZON)
-
-timesteps  <- dim(train_seq$X)[2]
-n_features <- dim(train_seq$X)[3]
-
-# ----------------------------
-# Train model (with early stopping)
-# ----------------------------
-model <- get_model(MODEL_NAME, timesteps, n_features, HORIZON)
-
-model |> compile(
-  optimizer = optimizer_adam(learning_rate = 1e-3),
-  loss = "mse",
-  metrics = list("mae")
-)
-
-callbacks <- list(
-  callback_early_stopping(monitor = "val_loss", patience = 5, restore_best_weights = TRUE),
-  callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 2)
-)
-
-history <- model |> fit(
-  x = train_seq$X, y = train_seq$y,
-  validation_data = list(val_seq$X, val_seq$y),
-  epochs = EPOCHS,
-  batch_size = BATCH_SIZE,
-  callbacks = callbacks,
-  verbose = 2
-)
-
-# ----------------------------
-# Evaluate on TEST (best weights are already restored)
-# ----------------------------
-pred_test <- as.numeric(model |> predict(test_seq$X))
-y_test    <- as.numeric(test_seq$y)
-
-# Report metrics on ORIGINAL scale only (best-score style)
-pred_orig <- minmax_inverse_one(pred_test, target, scaler)
-y_orig    <- minmax_inverse_one(y_test,  target, scaler)
-m_orig    <- metrics(y_orig, pred_orig)
-
-# Also capture best validation loss/mae from training history (optional, useful)
-h <- as.data.frame(history$metrics)
-best_val_loss <- min(h$val_loss, na.rm = TRUE)
-best_val_mae  <- if ("val_mae" %in% names(h)) min(h$val_mae, na.rm = TRUE) else NA
-
-row_out <- data.frame(
-  model = MODEL_NAME,
-  features = paste(features, collapse = ","),
-  lookback = LOOKBACK,
-  horizon = HORIZON,
-  best_val_loss = best_val_loss,
-  best_val_mae_scaled = best_val_mae,
-  MAE = unname(m_orig["MAE"]),
-  MSE = unname(m_orig["MSE"]),
-  RMSE = unname(m_orig["RMSE"])
-)
-
-if (!file.exists(BEST_SCORES_FILE)) {
-  write.csv(row_out, BEST_SCORES_FILE, row.names = FALSE)
+# Sort by date (chronological)
+df[[date_col]] <- as.character(df[[date_col]])
+date_parsed <- suppressWarnings(as.Date(df[[date_col]]))
+if (all(!is.na(date_parsed))) {
+  df[[date_col]] <- date_parsed
+  df <- df |> arrange(.data[[date_col]])
 } else {
-  # append
-  old <- read_csv(BEST_SCORES_FILE, show_col_types = FALSE)
-  out <- bind_rows(old, row_out)
-  write.csv(out, BEST_SCORES_FILE, row.names = FALSE)
+  # fallback: lexicographic
+  df <- df |> arrange(.data[[date_col]])
 }
 
-cat("\nSaved best-score row to: ", BEST_SCORES_FILE, "\n", sep = "")
-print(row_out)
+# Required cols for this project
+cols_all <- c("BRENT Close", "USDX", "SENT")
+missing_cols <- setdiff(cols_all, names(df))
+if (length(missing_cols) > 0) {
+  stop("Missing required columns in CSV: ", paste(missing_cols, collapse = ", "),
+       "\nYour project expects at least: BRENT Close, USDX, SENT.")
+}
+
+# Drop rows with NA in required cols
+df <- df[complete.cases(df[, cols_all]), ]
+
+n <- nrow(df)
+idx <- split_indices(n, TRAIN_FRAC, VAL_FRAC)
+i_train <- idx$i_train
+i_val   <- idx$i_val
+
+cat("Rows:", n, "\nTrain end idx:", i_train, "\nVal end idx:", i_val, "\nTest end idx:", n, "\n")
+
+# Fit scaler ONLY on train portion (project requirement)
+scaler <- minmax_fit(df[1:i_train, ], cols_all)
+
+# Scale full dataset using train scaler
+df_s <- minmax_transform(df, cols_all, scaler)
+
+dates <- df[[date_col]]
+
+TARGET_COL <- "BRENT Close"
+
+# ----------------------------
+# Core evaluation: train config -> validation MSE (original scale)
+# ----------------------------
+eval_config <- function(arch, cfg) {
+  # Ensure required feature columns exist for this feature set
+  features <- feature_cols_for_set(cfg$feature_set)
+  if (!all(features %in% names(df_s))) stop("Missing feature columns in scaled df.")
+
+  lookback <- cfg$timesteps
+
+  # Build sequences (by TARGET index range)
+  train_seq <- make_sequences_by_target_range(
+    df_s, dates, features, TARGET_COL, lookback, HORIZON,
+    target_idx_min = 1, target_idx_max = i_train
+  )
+
+  val_seq <- make_sequences_by_target_range(
+    df_s, dates, features, TARGET_COL, lookback, HORIZON,
+    target_idx_min = i_train + 1, target_idx_max = i_val
+  )
+
+  # Reset graph/session between runs (helps memory)
+  tryCatch({ keras::k_clear_session() }, error = function(e) NULL)
+  gc()
+
+  # Reproducibility
+  set.seed(SEED)
+  tensorflow::tf$random$set_seed(SEED)
+
+  model <- build_model(arch, lookback, length(features), cfg$units, cfg$dropout, HORIZON)
+
+  model |> compile(
+    optimizer = make_optimizer(cfg$optimizer, cfg$lr),
+    loss      = "mse"
+  )
+
+  # During tuning: keep output quiet, but still use val monitoring.
+  # NOTE: We do NOT early-stop tuning runs by default (to match paper's fixed-epoch tuning style).
+  history <- model |> fit(
+    x = train_seq$X, y = train_seq$y,
+    validation_data = list(val_seq$X, val_seq$y),
+    epochs = EPOCHS_TUNE,
+    batch_size = BATCH_SIZE,
+    verbose = 0
+  )
+
+  pred_val_scaled <- as.numeric(model |> predict(val_seq$X, verbose = 0))
+  y_val_scaled    <- as.numeric(val_seq$y)
+
+  pred_val_orig <- minmax_inverse_vec(pred_val_scaled, TARGET_COL, scaler)
+  y_val_orig    <- minmax_inverse_vec(y_val_scaled,    TARGET_COL, scaler)
+
+  val_mse <- mean((pred_val_orig - y_val_orig)^2)
+  if (!is.finite(val_mse)) val_mse <- Inf
+
+  list(val_mse = val_mse)
+}
+
+# ----------------------------
+# Grey Wolf Optimizer (GWO) for one architecture
+# ----------------------------
+gwo_optimize_arch <- function(arch) {
+  cat("\n==============================\n")
+  cat("GWO tuning architecture:", arch, "\n")
+  cat("Wolves:", N_WOLVES, " | Iters:", N_ITERS, " | Tune epochs:", EPOCHS_TUNE, "\n")
+  cat("==============================\n")
+
+  D <- 6  # lr, hidden, dropout, ts, opt, feat
+
+  # Init wolves in [0,1]
+  wolves <- matrix(runif(N_WOLVES * D), nrow = N_WOLVES, ncol = D)
+
+  eval_pos <- function(pos) {
+    cfg <- decode_wolf(pos)
+    # Try-catch so a single bad run doesn't kill the whole optimization
+    fit <- tryCatch({
+      eval_config(arch, cfg)$val_mse
+    }, error = function(e) {
+      message("WARN eval failed: ", conditionMessage(e))
+      Inf
+    })
+    fit
+  }
+
+  fitness <- apply(wolves, 1, eval_pos)
+
+  ord <- order(fitness)
+  alpha <- wolves[ord[1], , drop = FALSE]
+  beta  <- wolves[ord[2], , drop = FALSE]
+  delta <- wolves[ord[3], , drop = FALSE]
+  alpha_fit <- fitness[ord[1]]
+
+  best_hist <- data.frame(iter = 0, best_val_mse = alpha_fit)
+
+  no_improve <- 0
+  best_so_far <- alpha_fit
+
+  for (t in 1:N_ITERS) {
+    a <- 2 - 2 * (t - 1) / max(1, (N_ITERS - 1))  # 2 -> 0
+
+    for (i in 1:N_WOLVES) {
+      for (j in 1:D) {
+        r1 <- runif(1); r2 <- runif(1)
+        A1 <- 2 * a * r1 - a
+        C1 <- 2 * r2
+        D_alpha <- abs(C1 * alpha[1, j] - wolves[i, j])
+        X1 <- alpha[1, j] - A1 * D_alpha
+
+        r1 <- runif(1); r2 <- runif(1)
+        A2 <- 2 * a * r1 - a
+        C2 <- 2 * r2
+        D_beta <- abs(C2 * beta[1, j] - wolves[i, j])
+        X2 <- beta[1, j] - A2 * D_beta
+
+        r1 <- runif(1); r2 <- runif(1)
+        A3 <- 2 * a * r1 - a
+        C3 <- 2 * r2
+        D_delta <- abs(C3 * delta[1, j] - wolves[i, j])
+        X3 <- delta[1, j] - A3 * D_delta
+
+        wolves[i, j] <- (X1 + X2 + X3) / 3
+      }
+    }
+
+    # Keep in bounds
+    wolves <- pmin(pmax(wolves, 0), 1)
+
+    fitness <- apply(wolves, 1, eval_pos)
+    ord <- order(fitness)
+
+    alpha <- wolves[ord[1], , drop = FALSE]
+    beta  <- wolves[ord[2], , drop = FALSE]
+    delta <- wolves[ord[3], , drop = FALSE]
+    alpha_fit <- fitness[ord[1]]
+
+    best_hist <- bind_rows(best_hist, data.frame(iter = t, best_val_mse = alpha_fit))
+
+    if (alpha_fit + 1e-12 < best_so_far) {
+      best_so_far <- alpha_fit
+      no_improve <- 0
+    } else {
+      no_improve <- no_improve + 1
+    }
+
+    if (t %% 2 == 0) {
+      cat(sprintf("Iter %d/%d | best val MSE: %.6f\n", t, N_ITERS, alpha_fit))
+    }
+
+    # Practical early-stop on plateau (keeps runtime in check in later iterations).
+    if (QUALITY_MODE != "MAX" && no_improve >= 6) break
+    if (QUALITY_MODE == "MAX" && no_improve >= 10) break
+  }
+
+  best_cfg <- decode_wolf(alpha[1, ])
+  list(best_cfg = best_cfg, best_val_mse = best_so_far, history = best_hist)
+}
+
+# ----------------------------
+# Train final model and save predictions/metrics
+# ----------------------------
+train_and_save_best <- function(arch, cfg, tuned_val_mse) {
+  features <- feature_cols_for_set(cfg$feature_set)
+  lookback <- cfg$timesteps
+
+  # Sequences
+  train_seq <- make_sequences_by_target_range(
+    df_s, dates, features, TARGET_COL, lookback, HORIZON,
+    target_idx_min = 1, target_idx_max = i_train
+  )
+  val_seq <- make_sequences_by_target_range(
+    df_s, dates, features, TARGET_COL, lookback, HORIZON,
+    target_idx_min = i_train + 1, target_idx_max = i_val
+  )
+  test_seq <- make_sequences_by_target_range(
+    df_s, dates, features, TARGET_COL, lookback, HORIZON,
+    target_idx_min = i_val + 1, target_idx_max = n
+  )
+
+  tryCatch({ keras::k_clear_session() }, error = function(e) NULL)
+  gc()
+
+  set.seed(SEED)
+  tensorflow::tf$random$set_seed(SEED)
+
+  model <- build_model(arch, lookback, length(features), cfg$units, cfg$dropout, HORIZON)
+
+  model |> compile(
+    optimizer = make_optimizer(cfg$optimizer, cfg$lr),
+    loss      = "mse",
+    metrics   = list("mae")
+  )
+
+  callbacks <- list()
+  if (USE_EARLY_STOPPING_FINAL) {
+    callbacks <- list(
+      callback_early_stopping(
+        monitor = "val_loss",
+        patience = ES_PATIENCE_FINAL,
+        restore_best_weights = TRUE
+      ),
+      callback_reduce_lr_on_plateau(
+        monitor = "val_loss",
+        factor = 0.5,
+        patience = max(5, round(ES_PATIENCE_FINAL / 3)),
+        verbose = 0
+      )
+    )
+  }
+
+  cat("\nFinal training:", arch, " | Feature set:", cfg$feature_set,
+      " | TS:", lookback, " | H:", cfg$units,
+      " | Drop:", sprintf("%.3f", cfg$dropout),
+      " | LR:", sprintf("%.6f", cfg$lr),
+      " | Opt:", cfg$optimizer, "\n", sep = "")
+
+  history <- model |> fit(
+    x = train_seq$X, y = train_seq$y,
+    validation_data = list(val_seq$X, val_seq$y),
+    epochs = EPOCHS_FINAL,
+    batch_size = BATCH_SIZE,
+    callbacks = callbacks,
+    verbose = 2
+  )
+
+  # Predictions (val + test)
+  pred_val_scaled  <- as.numeric(model |> predict(val_seq$X, verbose = 0))
+  pred_test_scaled <- as.numeric(model |> predict(test_seq$X, verbose = 0))
+  y_val_scaled     <- as.numeric(val_seq$y)
+  y_test_scaled    <- as.numeric(test_seq$y)
+
+  pred_val_orig  <- minmax_inverse_vec(pred_val_scaled,  TARGET_COL, scaler)
+  pred_test_orig <- minmax_inverse_vec(pred_test_scaled, TARGET_COL, scaler)
+  y_val_orig     <- minmax_inverse_vec(y_val_scaled,     TARGET_COL, scaler)
+  y_test_orig    <- minmax_inverse_vec(y_test_scaled,    TARGET_COL, scaler)
+
+  m_val  <- metrics(y_val_orig,  pred_val_orig)
+  m_test <- metrics(y_test_orig, pred_test_orig)
+
+  # Naming
+  feature_prefix <- feature_prefix_for_set(cfg$feature_set)
+  model_id <- paste0(feature_prefix, "-", arch)
+
+  # Save model (optional)
+  if (SAVE_MODELS) {
+    model_path <- file.path(MODEL_DIR, paste0(model_id, ".keras"))
+    tryCatch({
+      save_model_tf(model, model_path)
+      cat("Saved model to: ", model_path, "\n", sep = "")
+    }, error = function(e) {
+      message("WARN: could not save model: ", conditionMessage(e))
+    })
+  }
+
+  # Save prediction CSVs with target_date for alignment in ensemble
+  val_out <- data.frame(
+    target_date   = as.character(val_seq$target_date),
+    target_index  = val_seq$target_index,
+    y_true_scaled = y_val_scaled,
+    y_pred_scaled = pred_val_scaled,
+    y_true_orig   = y_val_orig,
+    y_pred_orig   = pred_val_orig
+  )
+  test_out <- data.frame(
+    target_date   = as.character(test_seq$target_date),
+    target_index  = test_seq$target_index,
+    y_true_scaled = y_test_scaled,
+    y_pred_scaled = pred_test_scaled,
+    y_true_orig   = y_test_orig,
+    y_pred_orig   = pred_test_orig
+  )
+
+  write.csv(val_out,  file.path(OUT_DIR, paste0("pred_val_",  model_id, ".csv")), row.names = FALSE)
+  write.csv(test_out, file.path(OUT_DIR, paste0("pred_test_", model_id, ".csv")), row.names = FALSE)
+
+  # Save best params per arch
+  params_row <- data.frame(
+    architecture = arch,
+    model_id = model_id,
+    feature_set = cfg$feature_set,
+    timesteps = cfg$timesteps,
+    lr = cfg$lr,
+    dropout = cfg$dropout,
+    hidden_units = cfg$units,
+    optimizer = cfg$optimizer,
+    tuned_val_mse = tuned_val_mse,
+    val_MAE = unname(m_val["MAE"]),
+    val_MSE = unname(m_val["MSE"]),
+    val_RMSE = unname(m_val["RMSE"]),
+    test_MAE = unname(m_test["MAE"]),
+    test_MSE = unname(m_test["MSE"]),
+    test_RMSE = unname(m_test["RMSE"])
+  )
+  write.csv(params_row, file.path(OUT_DIR, paste0("best_params_", arch, ".csv")), row.names = FALSE)
+
+  # Append to global best score file
+  if (!file.exists(BEST_SCORES_FILE)) {
+    write.csv(params_row, BEST_SCORES_FILE, row.names = FALSE)
+  } else {
+    old <- read_csv(BEST_SCORES_FILE, show_col_types = FALSE)
+    out <- bind_rows(old, params_row)
+    write.csv(out, BEST_SCORES_FILE, row.names = FALSE)
+  }
+
+  cat("Saved predictions:\n",
+      " - ", file.path(OUT_DIR, paste0("pred_val_",  model_id, ".csv")), "\n",
+      " - ", file.path(OUT_DIR, paste0("pred_test_", model_id, ".csv")), "\n", sep = "")
+  cat("Saved params + scores:\n",
+      " - ", file.path(OUT_DIR, paste0("best_params_", arch, ".csv")), "\n",
+      " - ", BEST_SCORES_FILE, "\n", sep = "")
+
+  invisible(params_row)
+}
+
+# ----------------------------
+# MAIN: tune + train per architecture
+# ----------------------------
+cat("\n=== TRAIN MODELS (GWO) ===\n")
+cat("QUALITY_MODE:", QUALITY_MODE, "\n")
+cat("HORIZON:", HORIZON, "\n")
+cat("Train/Val/Test:", TRAIN_FRAC, "/", VAL_FRAC, "/", (1 - TRAIN_FRAC - VAL_FRAC), "\n")
+
+for (arch in ARCHITECTURES) {
+  res <- gwo_optimize_arch(arch)
+  # Save tuning trace (best validation MSE per iteration)
+  tryCatch({
+    write.csv(res$history, file.path(OUT_DIR, paste0("gwo_history_", arch, ".csv")), row.names = FALSE)
+  }, error = function(e) {
+    message("WARN: could not write GWO history: ", conditionMessage(e))
+  })
+  best_cfg <- res$best_cfg
+
+  cat("\nBest for ", arch, ":\n", sep = "")
+  print(best_cfg)
+  cat("Best tuned validation MSE (orig scale):", res$best_val_mse, "\n")
+
+  train_and_save_best(arch, best_cfg, tuned_val_mse = res$best_val_mse)
+}
+
+cat("\nDONE.\nNext: run gwo_ensemble.R to learn ensemble weights.\n")
