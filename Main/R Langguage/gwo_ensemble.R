@@ -2,16 +2,16 @@
 # ------------------------------------------------------------------------------
 # Grey Wolf Optimizer (GWO) for weighted ensemble of model predictions.
 #
-# This script expects the prediction CSVs produced by train_models.R:
+# Expected inputs (produced by train_models.R):
 #   outputs/pred_val_<MODEL>.csv
 #   outputs/pred_test_<MODEL>.csv
 #
 # Each prediction file must include:
 #   target_date, y_true_orig, y_pred_orig
 #
-# Key improvement vs older versions:
-# - Aligns predictions by target_date (works even when models use different TS/lookback)
-# - Fits weights ONLY on validation by default (prevents leakage)
+# Fix vs previous version:
+# - Aligns models ONLY by target_date (no risky join on floating y_true)
+# - Verifies y_true consistency across models within tolerance
 # - Enforces non-negative weights summing to 1 via softmax(z)
 # ------------------------------------------------------------------------------
 
@@ -29,7 +29,7 @@ OUT_DIR <- "outputs"
 # If set: must match filename suffix exactly (e.g., "SENT-Bi-GRU")
 MODELS <- NULL
 
-# Fit objective on validation set (project text: minimize validation MSE)
+# Fit objective on validation set (paper text: minimize validation MSE)
 # Choose: "MSE", "RMSE", "MAE"
 OBJECTIVE <- "MSE"
 
@@ -38,8 +38,11 @@ N_WOLVES <- 40
 N_ITERS  <- 250
 SEED     <- 42
 
-# Safety: do NOT fit on test unless you explicitly allow it
+# Do NOT fit on test unless you explicitly allow it
 ALLOW_TEST_FIT_IF_NO_VAL <- FALSE
+
+# Tolerance for y_true agreement across model files (after aligning by date)
+YTRUE_TOL <- 1e-6
 
 # ----------------------------
 # Helpers
@@ -64,7 +67,6 @@ softmax <- function(z) {
   e / sum(e)
 }
 
-# Read prediction file for one model and split
 read_pred <- function(model_id, split) {
   path <- file.path(OUT_DIR, paste0("pred_", split, "_", model_id, ".csv"))
   if (!file.exists(path)) stop("Missing file: ", path)
@@ -84,36 +86,34 @@ read_pred <- function(model_id, split) {
   )
 }
 
-# Build aligned (date-joined) matrix for a split
-build_matrix <- function(models, split) {
-  dfs <- lapply(models, function(m) {
-    d <- read_pred(m, split)
-    names(d)[names(d) == "pred"] <- m
-    d
-  })
+# Align on target_date only; verify y_true matches across models
+build_matrix <- function(models, split, tol = YTRUE_TOL) {
+  if (length(models) < 2) stop("Need at least 2 models for an ensemble.")
 
-  # Reduce inner joins on target_date
-  merged <- dfs[[1]]
-  for (i in 2:length(dfs)) {
-    merged <- merged |> inner_join(dfs[[i]], by = c("target_date", "y_true"))
-  }
+  base <- read_pred(models[1], split)
+  names(base)[names(base) == "pred"] <- models[1]
+  merged <- base
 
-  # If y_true differs numerically due to floating, fall back to date-join then check
-  if (nrow(merged) == 0) {
-    merged <- dfs[[1]]
-    for (i in 2:length(dfs)) {
-      merged <- merged |> inner_join(dfs[[i]] |> select(-y_true), by = "target_date")
+  for (m in models[-1]) {
+    dm <- read_pred(m, split)
+
+    dm2 <- dm |> transmute(
+      target_date = target_date,
+      y_true_m = y_true,
+      !!m := pred
+    )
+
+    merged <- merged |> inner_join(dm2, by = "target_date")
+
+    # Check y_true agreement
+    max_diff <- max(abs(merged$y_true - merged$y_true_m), na.rm = TRUE)
+    if (!is.finite(max_diff) || max_diff > tol) {
+      stop("y_true differs across models after aligning by target_date.\n",
+           "Max abs diff = ", max_diff, " (tol=", tol, ").\n",
+           "Ensure all models use the same dataset + horizon and write y_true_orig consistently.")
     }
-    # Verify y_true consistency
-    # Use y_true from the first model file, and ensure other files match within tolerance.
-    for (m in models) {
-      # We don't have other y_true columns anymore, so rebuild checks quickly
-      other <- read_pred(m, split)
-      chk <- merged |> inner_join(other, by = "target_date", suffix = c("", ".other"))
-      if (max(abs(chk$y_true - chk$y_true.other), na.rm = TRUE) > 1e-6) {
-        stop("y_true differs across models after aligning by date. Ensure all models were built from the same dataset & horizon.")
-      }
-    }
+
+    merged <- merged |> select(-y_true_m)
   }
 
   y <- merged$y_true
@@ -127,7 +127,7 @@ build_matrix <- function(models, split) {
 # ----------------------------
 if (is.null(MODELS)) {
   files <- list.files(OUT_DIR, pattern = "^pred_val_.*\\.csv$", full.names = FALSE)
-  if (length(files) == 0) stop("No validation prediction files found in ", OUT_DIR, ". Run train_models.R first.")
+  if (length(files) == 0) stop("No validation prediction files found in ", OUT_DIR, ". Run train_models first.")
 
   MODELS <- sub("^pred_val_", "", files)
   MODELS <- sub("\\.csv$", "", MODELS)
@@ -167,8 +167,8 @@ if (!val_ok) {
   val <- test
 }
 
-y_fit <- val$y
-P_fit <- val$P
+y_fit  <- val$y
+P_fit  <- val$P
 y_test <- test$y
 P_test <- test$P
 
