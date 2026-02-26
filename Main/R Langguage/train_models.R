@@ -821,4 +821,4 @@ for (arch in ARCHITECTURES) {
   train_and_save_best(arch, best_cfg, tuned_val_mse = res$best_val_mse)
 }
 
-cat("\nDONE.\nNext: run gwo_ensemble_v2_fixed.R to learn ensemble weights.\n")
+cat("\nDONE.\nNext: run gwo_ensemble.R to learn ensemble weights.\n")
