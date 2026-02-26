@@ -23,6 +23,7 @@ All R implementation files are located in:
 Main/R Language/
 ├── dataset/                      # Input CSV lives here
 │   └── processed_data_best_corr_sentiment.csv
+├── ARIMA Baseline.R     
 ├── train_models.R                # Train one model; saves metrics + predictions
 ├── gwo_ensemble.R                # (Optional) GWO weighted ensemble
 └── outputs/                      # Generated outputs (auto-created)
